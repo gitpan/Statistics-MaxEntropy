@@ -14,17 +14,3 @@ In addition you will need
 	Data::Dumper
 
 -----------
-
-If you want to use Bit::Vector for representing bitvectors, edit
-MaxEntropy.pm and Candidates.pm such that the line 
-
-	$SPARSE=1;
-
-becomes
-
-	$SPARSE=0;
-
-in both of these files.
-
------------
-

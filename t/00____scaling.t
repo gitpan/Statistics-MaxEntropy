@@ -1,4 +1,5 @@
 #!/Utils/bin/perl5
+#!/usr/bin/perl
 
 print "1..7\n";
 $i = 1;
@@ -10,7 +11,7 @@ use Statistics::MaxEntropy qw($debug
 			      $KL_min
 			      $SAMPLE_size);
 
-use Statistics::Candidates qw(write);
+use Statistics::Candidates;
 
 use vars qw($scaling
 	    $sampling
@@ -27,7 +28,7 @@ use vars qw($scaling
 # debugging messages; default 0
 $debug = 0;
 # maximum number of iterations for IIS; default 100
-$NEWTON_max_it = 100;
+$NEWTON_max_it = 25;
 # minimal distance between new and old x for Newton's method; default 0.001
 $NEWTON_min = 0.0001;
 # maximum number of iterations for Newton's method; default 100
@@ -47,8 +48,8 @@ $dump_file_1 = "$TMP/dump.1.txt";
 # test the scalers for each of the sampling methods
 $events=Statistics::MaxEntropy->new($events_file);
 $SAMPLE_size = 100;
-for $sampling ("mc", "enum", "corpus") {
-    for $scaling ("gis", "iis") {
+for $sampling ("enum", "corpus", "mc") {
+    for $scaling ("iis", "gis") {
  	$events->clear();
  	$events->scale($sampling, $scaling);
  	print "ok $i\n";

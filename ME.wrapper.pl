@@ -37,10 +37,6 @@ use Statistics::MaxEntropy qw($debug
 			      $KL_min
 			      $NEWTON_min
 			      $SAMPLE_size
-			      scale
-			      fi
-			      write_parameters
-			      write_parameters_with_names
 			      );
 use Statistics::Candidates;
 

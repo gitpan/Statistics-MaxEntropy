@@ -3,8 +3,7 @@ use ExtUtils::MakeMaker;
 # the contents of the Makefile that is written.
 WriteMakefile(
     'NAME'	=> 'Statistics::MaxEntropy', 
-    'PREREQ_PM' => {'Bit::Vector' => '5.3',
-			'Data::Dumper' => '2.09'},
+    'PREREQ_PM' => {'Data::Dumper' => '2.09'},
     'VERSION_FROM' => 'MaxEntropy.pm', # finds $VERSION
     'dist'       => {'COMPRESS'  => 'gzip', 'SUFFIX' => 'gz'},
     'EXE_FILES' => [qw(ME.wrapper.pl)]

@@ -39,7 +39,6 @@ package Statistics::MaxEntropy;
 use vars qw($VERSION
 	    @ISA
 	    @EXPORT
-	    $SPARSE
 	    $VECTOR_PACKAGE
 
 	    $debug
@@ -58,15 +57,8 @@ use vars qw($VERSION
 ##---------------------------------------------------------------------------##
 use strict;
 use diagnostics -verbose;
-$SPARSE = 1;
-if ($SPARSE) {
-    $VECTOR_PACKAGE = "Statistics::SparseVector";
-    use Statistics::SparseVector;
-}
-else {
-    $VECTOR_PACKAGE = "Bit::Vector";
-    use Bit::Vector;
-}
+use Statistics::SparseVector;
+$VECTOR_PACKAGE = "Statistics::SparseVector";
 use POSIX;
 use Carp;
 use Data::Dumper;
@@ -84,26 +76,13 @@ require AutoLoader;
 	     $KL_max_it
 	     $NEWTON_max_it
 	     $SAMPLE_size
-
-	     new
-	     DESTROY
-	     write
-	     scale
-	     dump
-	     undump
-	     
-	     fi
-	     random_parameters
-	     set_parameters_to
-	     write_parameters
-	     write_parameters_with_names
 	     );
 
-$VERSION = '0.8';
+$VERSION = '0.9';
 
 
 # default values for some configurable parameters
-$NEWTON_max_it = 200;
+$NEWTON_max_it = 20;
 $NEWTON_min = 0.001;
 $KL_max_it = 100;
 $KL_min = 0.001;
@@ -113,6 +92,14 @@ $cntrl_c_pressed = 0;
 $cntrl_backslash_pressed = 0;
 $SIG{INT} = \&catch_cntrl_c;
 $SIG{QUIT} = \&catch_cntrl_backslash;
+
+
+# checks floats
+sub is_float {
+    my($f) = @_;
+
+    return ($f =~ /^([+-]?)(?=\d|\.\d)\d*(\.\d*)?([Ee]([+-]?\d+))?$/);
+}
 
 
 # interrrupt routine for control c
@@ -165,26 +152,30 @@ sub sample {
 	$sample->{NR_FEATURES} = $self->{NR_FEATURES};
 	# refer to the parameters of $self
 	$sample->{PARAMETERS} = $self->{PARAMETERS};
+	$sample->{NEED_CORRECTION_FEATURE} = 1;
 	$sample->{CORRECTION_PARAMETER} = $self->{CORRECTION_PARAMETER};
 	$sample->{E_REF} = $self->{E_REF};
 	$sample->{THIS_IS_A_SAMPLE} = 1;
 	$sample->mc($self);
-	$self->prepare_model();
-    }
-    elsif ($self->{SAMPLING} eq "enum") {
-	$sample = $self->new();
-	$sample->{SCALER} = $self->{SCALER};
-	$sample->{NR_FEATURES} = $self->{NR_FEATURES};
-	$sample->{PARAMETERS} = $self->{PARAMETERS};
-	$sample->{CORRECTION_PARAMETER} = $self->{CORRECTION_PARAMETER};
-	$sample->{E_REF} = $self->{E_REF};
-	$sample->{THIS_IS_A_SAMPLE} = 1;
-	$sample->enum();
+	$sample->{CLASSES_CHANGED} = 1;
 	$sample->prepare_model();
     }
-    else { # taken to be "corpus"
+    elsif ($self->{SAMPLING} eq "enum") {
+ 	$sample = $self->new();
+ 	$sample->{SCALER} = $self->{SCALER};
+ 	$sample->{SAMPLING} = "enum";
+ 	$sample->{NR_FEATURES} = $self->{NR_FEATURES};
+ 	$sample->{PARAMETERS} = $self->{PARAMETERS};
+ 	$sample->{NEED_CORRECTION_FEATURE} = 1;
+ 	$sample->{CORRECTION_PARAMETER} = $self->{CORRECTION_PARAMETER};
+ 	$sample->{E_REF} = $self->{E_REF};
+ 	$sample->{THIS_IS_A_SAMPLE} = 1;
+	$sample->{M} = $self->{NR_FEATURES};
+    }
+    else { # "corpus"
 	$sample = $self;
     }
+    $sample->prepare_sample();
     return($sample);
 }
 
@@ -224,6 +215,7 @@ sub read {
     print "Opened $file\n";
 
     # read the names of the features, skip comment
+    # note that feature name are in reverse order now 
     do {
 	$feature_names = <EVENTS>;
     } until ($feature_names !~ /\#.*/);
@@ -309,7 +301,7 @@ sub write_parameters {
     print "Opened $file\n";
 
     for ($i = 0; $i < $self->{NR_FEATURES}; $i++) {
-	if ($self->{FEATURE_IGNORED}{$i}) {
+	if ($self->{FEATURE_IGNORE}{$i}) {
 	    print DISTR "IGNORED\n";
 	}
 	else {
@@ -336,16 +328,25 @@ sub write_parameters_with_names {
 	$self->die("Could not open $file\n");
     print "Opened $file\n";
 
+    # preamble
     print DISTR "$self->{NR_FEATURES}\n";
+    print DISTR "$self->{SCALER}\n";
+    if ($self->{SCALER} eq "gis") {
+	print DISTR "$self->{M}\n";
+	print DISTR "$self->{CORRECTION_PARAMETER}\n";
+    }
+
+    # print feature names with parameters
+    # in the meanwhile build the bitmask
     $bitmask = "";
     for ($x = 0; $x < $self->{NR_FEATURES}; $x++) {
 	print DISTR "$self->{FEATURE_NAMES}[$self->{NR_FEATURES} - $x - 1]\t" .
 	    "$self->{PARAMETERS}[$x]\n";
-	if ($self->{FEATURE_IGNORED}{$x}) {
-	    $bitmask .= "0";
+	if ($self->{FEATURE_IGNORE}{$x}) {
+	    $bitmask = "0" . $bitmask;
 	}
 	else {
-	    $bitmask .= "1";
+	    $bitmask = "1" . $bitmask;
 	}
     }
     print DISTR "$bitmask\n";
@@ -394,12 +395,17 @@ sub init_parameters {
     my($self) = @_;
 
     if (!$self->{PARAMETERS_INITIALISED}) {
-	if ($self->{SCALER} eq "gis") {
-	    $self->set_parameters_to(1);
+	if ($self->{SAMPLING} eq "mc") {
+	    # otherwise bits will be flipped with prob 1.
+	    $self->random_parameters();
 	}
 	else {
-	    $self->random_parameters();
-#	    $self->set_parameters_to(1);
+	    if ($self->{SCALER} eq "gis") {
+		$self->set_parameters_to(0);
+	    }
+	    else {
+		$self->set_parameters_to(0);
+	    }
 	}
 	$self->{PARAMETERS_INITIALISED} = 1;
     }
@@ -419,15 +425,11 @@ sub check {
 
     $sum = 0;
     for ($x = 0; $x < $self->{NR_CLASSES}; $x++) {
-	if ($self->{CLASS_PROBS}[$x] == 0) {
-	    print "Initial distribution not ok; event $x\n";
+	if ($self->{CLASS_EXP_WEIGHTS}[$x] == 0) {
+	    print "Initial distribution not ok; class $x\n";
+	    print $self->{CLASS_EXP_WEIGHTS}[$x], "\t", $self->{CLASSES}[$x]->to_Bin(),"\n";
 	}
-	$sum += $self->{CLASS_PROBS}[$x];
     }
-    if ($debug && ($sum != 1)) {
-	print "Sum of the probabilities: $sum\n";
-    }
-
     for ($f = 0; $f < $self->{NR_FEATURES}; $f++) {
 	$sum = 0;
 	for ($x = 0; $x < $self->{NR_CLASSES}; $x++) {
@@ -470,24 +472,6 @@ sub write {
 }
 
 
-# makes enum strings from Bit::Vector internal (C) format if necessary
-sub perldata {
-    my($self) = @_;
-
-    @{$self->{CLASSES}} = map {$_->to_Enum()} @{$self->{CLASSES}};
-}
-
-
-# makes Bit::Vector internal format from bitstrings if necessary
-sub cdata {
-    my($self) = @_;
-
-    @{$self->{CLASSES}} = map 
-    {$VECTOR_PACKAGE->new_Enum($self->{NR_FEATURES}, $_)} 
-    @{$self->{CLASSES}};
-}
-
-
 # reads a dump, and evaluates it into an object
 sub undump {
     my($class, $file) = @_;
@@ -506,9 +490,6 @@ sub undump {
 
     # and undump
     eval $x;
-    if (!$SPARSE) {
-	$VAR1->cdata();
-    }
     print "Undumped $VAR1->{NR_EVENTS} events, $VAR1->{NR_CLASSES} classes, " . 
 	"and $VAR1->{NR_FEATURES} features\n";
     print "Closed $file\n";
@@ -534,7 +515,7 @@ sub dump {
 
     # build something that we can sort
     # ONLY FOR CORPUS!
-    if (!$self->{THIS_IS_A_SAMPLE}) {
+    if (!$self->{THIS_IS_A_SAMPLE} && $self->{PARAMETERS}) {
     for ($f = 0; $f < $self->{NR_FEATURES}; $f++) {
         $features{$self->{FEATURE_NAMES}[$self->{NR_FEATURES} - $f - 1]} = 
 	    $self->{PARAMETERS}[$f];
@@ -553,23 +534,10 @@ sub dump {
 					   }
 				   }
 				   keys(%features));
-}
-
-    # save classes
-    if (!$SPARSE) {
-	@bitvecs = @{$self->{CLASSES}};
     }
+
     $dump = Data::Dumper->new([$self]);
-    # perldata makes bitstrings
-    if (!$SPARSE) {
-	$dump->Freezer('perldata');
-    }
     print DUMP $dump->Dump();
-    # restore classes
-    if (!$SPARSE) {
-	@{$self->{CLASSES}} = @bitvecs;
-    }
-
     print "Dumped $self->{NR_EVENTS} events, $self->{NR_CLASSES} classes, " . 
 	"and $self->{NR_FEATURES} features\n";
 
@@ -611,55 +579,33 @@ sub active_features {
     if ($self->{CLASSES_CHANGED}) {
 	# M is needed for both gis and iis
 	# NEED_CORRECTION_FEATURE is for gis only
-	# NR_FEATURES_ACTIVE for iis only
 	$self->{M} = 0;
 	$self->{NEED_CORRECTION_FEATURE} = 0;
-	undef $self->{NR_FEATURES_ACTIVE};
 	for ($i = 0; $i < $self->{NR_CLASSES}; $i++) {
-	    $self->{NR_FEATURES_ACTIVE}[$i] = 0;
-	    for ($j = 0; $j < $self->{NR_FEATURES}; $j++) {
-		$self->{NR_FEATURES_ACTIVE}[$i] += 
-		    $self->{CLASSES}[$i]->bit_test($j);
-	    }
-	    if (!$self->{M}) { 
-		# is undefined!
-		$self->{M} = $self->{NR_FEATURES_ACTIVE}[$i];
-	    }
-	    elsif ($self->{NR_FEATURES_ACTIVE}[$i] > $self->{M}) {
+	    if ($self->{CLASSES}[$i]->Norm() > $self->{M}) {
 		# higher nr_features_active found
-		$self->{M} = $self->{NR_FEATURES_ACTIVE}[$i];
+		$self->{M} = $self->{CLASSES}[$i]->Norm();
 		$self->{NEED_CORRECTION_FEATURE} = 1;
-	    }
-	    if ($debug) {
-		print "f_#($i) = $self->{NR_FEATURES_ACTIVE}[$i]\n";
 	    }
 	}
 	if ($debug) {
 	    print "M = $self->{M}\n";
 	}
 	# set up a hash from m to classes HOL; and the correction_feature
-	# M_FEATURES_ACTIVE IS FOR iis
 	# CORRECTION_FEATURE FOR gis
 	undef $self->{M_FEATURES_ACTIVE};
 	for ($i = 0; $i < $self->{NR_CLASSES}; $i++) {
-	    push @{$self->{M_FEATURES_ACTIVE}{$self->{NR_FEATURES_ACTIVE}[$i]}}, 
-	         $i;
-	    $self->{CORRECTION_FEATURE}[$i] = $self->{M} - 
-		$self->{NR_FEATURES_ACTIVE}[$i];
-	    # changed $self->{M} into $self->{NR_FEATURES}
-#	    $self->{CORRECTION_FEATURE}[$i] = $self->{NR_FEATURES} - 
-#		$self->{NR_FEATURES_ACTIVE}[$i];
+	    if ($self->{SCALER} eq "gis") {
+		$self->{CORRECTION_FEATURE}[$i] = 
+		    $self->{M} - $self->{CLASSES}[$i]->Norm();
+	    }
 	}
 	if ($debug) {
 	    print "M = $self->{M}\n";
 	}
 	# observed feature expectations
 	if (!$self->{THIS_IS_A_SAMPLE}) {
-	    for ($j = 0; $j < $self->{NR_FEATURES}; $j++) {
-		# observed feature expectations; gis and iis
-		$self->E_reference($j);
-	    }
-	    $self->E_reference_correction();
+	    $self->E_reference();
 	}
 	undef $self->{CLASSES_CHANGED};
     }
@@ -670,41 +616,27 @@ sub active_features {
 sub prepare_model {
     my($self) = @_;
 
-    my ($x, 
-	$f, 
-	$sum);
+    my ($x,
+	$f);
 
     $self->active_features();
     if ($self->{PARAMETERS_CHANGED}) {
 	$self->{Z} = 0;
-	for ($x = 0; $x < $self->{NR_CLASSES}; $x++) {    
-	    $sum = 0;
-	    for ($f = 0; $f < $self->{NR_FEATURES}; $f++) {
-		if (!$self->{FEATURE_IGNORE}{$f} && 
-		    $self->{CLASSES}[$x]->bit_test($f)) {
-		    $sum += $self->{PARAMETERS}[$f];
-		}
+	for ($x = 0; $x < $self->{NR_CLASSES}; $x++) {
+	    $self->{CLASS_LOG_WEIGHTS}[$x] = 0;
+	    for $f ($self->{CLASSES}[$x]->indices()) {
+		$self->{CLASS_LOG_WEIGHTS}[$x] += $self->{PARAMETERS}[$f];
 	    }
 	    if ($self->{NEED_CORRECTION_FEATURE} && ($self->{SCALER} eq "gis")) {
-		$sum += $self->{CORRECTION_FEATURE}[$x] * 
+		$self->{CLASS_LOG_WEIGHTS}[$x] += $self->{CORRECTION_FEATURE}[$x] * 
 		    $self->{CORRECTION_PARAMETER};
 	    }
-	    $self->{CLASS_WEIGHTS}[$x] = exp($sum);
-	    $self->{Z} += $self->{CLASS_WEIGHTS}[$x];
+	    $self->{CLASS_EXP_WEIGHTS}[$x] = exp($self->{CLASS_LOG_WEIGHTS}[$x]);
+	    $self->{Z} += $self->{CLASS_EXP_WEIGHTS}[$x];
 	}
-	# normalise
-	for ($x = 0; $x < $self->{NR_CLASSES}; $x++) {    
-	    $self->{CLASS_PROBS}[$x] = $self->{CLASS_WEIGHTS}[$x] / $self->{Z};
-	}
-	# expectations
-	for ($f = 0; $f < $self->{NR_FEATURES}; $f++) {
-	    $self->E_loglinear($f);
-	}
-	$self->E_loglinear_correction();
-	# A_{mj}
-	if ($self->{SCALER} eq "iis") {
-	    $self->A();
-	}
+	print "prepare_model: \$Z is not a number: $self->{Z}\n"
+		unless is_float($self->{Z});
+
 	if (!$self->{THIS_IS_A_SAMPLE}) {
 	    $self->entropies();
 	}
@@ -714,67 +646,87 @@ sub prepare_model {
 }
 
 
+sub prepare_sample {
+    my($self) = @_;
+
+    # expectations
+    if ($self->{SCALER} eq "gis") {
+	$self->E_loglinear();
+    }
+    else {
+	# A_{mj}
+	$self->A();
+    }
+}
+
+
+# feature expectations for the MaxEnt distribution
 sub E_loglinear {
-    my($self, $i) = @_;
-
-    my($x,
-       $sum);
-
-    $sum = 0;
-    for ($x = 0; $x < $self->{NR_CLASSES}; $x++) {    
-	if ($self->{CLASSES}[$x]->bit_test($i)) {
-	    $sum += $self->{CLASS_PROBS}[$x];
-	}
-    }
-    $self->{E_LOGLIN}[$i] = $sum;
-}
-
-
-sub E_loglinear_correction {
     my($self) = @_;
 
     my($x,
-       $sum);
+       $f,
+       $vec,
+       $weight,
+       $Z);
 
-    if ($self->{NEED_CORRECTION_FEATURE} && ($self->{SCALER} eq "gis")) {
-	$sum = 0;
-	for ($x = 0; $x < $self->{NR_CLASSES}; $x++) {    
-	    $sum += $self->{CORRECTION_FEATURE}[$x] * $self->{CLASS_PROBS}[$x];
+    undef $self->{E_LOGLIN};
+    if ($self->{SAMPLING} eq "enum") {
+	$vec = $VECTOR_PACKAGE->new($self->{NR_FEATURES});
+	$self->{Z} = 0;
+	for ($x = 0; $x < 2 ** $self->{NR_FEATURES}; $x++) {
+	    $weight = $self->weight($vec);
+	    for $f ($vec->indices()) {
+		$self->{E_LOGLIN}[$f] += $weight;
+	    }
+	    $self->{E_LOGLIN}[$self->{NR_FEATURES}] += $weight *
+		($self->{M} - $vec->Norm());
+	    $self->{Z} += $weight;
+	    $vec->increment();
 	}
-	$self->{E_LOGLIN}[$self->{NR_FEATURES}] = $sum;
-    }
-}
-
-
-sub E_reference {
-    my($self, $i) = @_;
-
-    my($x,
-       $sum);
-
-    $sum = 0;
-    for ($x = 0; $x < $self->{NR_CLASSES}; $x++) {
-	if ($self->{CLASSES}[$x]->bit_test($i)) {
-	    $sum += $self->{FREQ}[$x];
+	for $f (0..$self->{NR_FEATURES}) {
+	    $self->{E_LOGLIN}[$f] /= $self->{Z};
 	}
     }
-    $self->{E_REF}[$i] = $sum / $self->{NR_EVENTS};
-}
-
-
-sub E_reference_correction {
-    my($self) = @_;
-
-    my($x,
-       $sum);
-
-    if (($self->{SCALER} eq "gis") && ($self->{NEED_CORRECTION_FEATURE})) {
-	$sum = 0;
+    else { # either corpus or mc sample
 	for ($x = 0; $x < $self->{NR_CLASSES}; $x++) {
-	    $sum += $self->{CORRECTION_FEATURE}[$x] * 
+	    for $f ($self->{CLASSES}[$x]->indices()) {
+		$self->{E_LOGLIN}[$f] += $self->{CLASS_EXP_WEIGHTS}[$x];
+	    }
+	    if ($self->{NEED_CORRECTION_FEATURE}) {
+		$self->{E_LOGLIN}[$self->{NR_FEATURES}] +=
+		    $self->{CLASS_EXP_WEIGHTS}[$x] *
+			($self->{M} - $self->{CLASSES}[$x]->Norm());
+	    }
+	}
+	for $f (0..$self->{NR_FEATURES}) {
+	    $self->{E_LOGLIN}[$f] /= $self->{Z};
+	}
+    }
+}
+
+
+# observed feature expectations
+sub E_reference {
+    my($self) = @_;
+
+    my($x,
+       $f,
+       @sum);
+
+    for ($x = 0; $x < $self->{NR_CLASSES}; $x++) {
+	for $f ($self->{CLASSES}[$x]->indices()) {
+	    $sum[$f] += $self->{FREQ}[$x];
+	}
+	if ($self->{SCALER} eq "gis") {
+	    $sum[$self->{NR_FEATURES}] += $self->{CORRECTION_FEATURE}[$x] * 
 		$self->{FREQ}[$x];
 	}
-	$self->{E_REF}[$self->{NR_FEATURES}] = $sum / $self->{NR_EVENTS};
+    }
+    for $f (0..$self->{NR_FEATURES}) {
+	if ($sum[$f]) {
+	    $self->{E_REF}[$f] = $sum[$f] / $self->{NR_EVENTS};
+	}
     }
 }
 
@@ -784,46 +736,38 @@ sub entropies {
     my($self) = @_;
 
     my ($i, 
-	$p,
-	$log_p,
-	$p_ref,
-	$log_p_ref);
+	$w,
+	$log_w,
+	$w_ref,
+	$log_w_ref);
 
     $self->{H_p} = 0;
     $self->{H_cross} = 0;
     $self->{H_p_ref} = 0;
     $self->{KL} = 0;
     for ($i = 0; $i < $self->{NR_CLASSES}; $i++) {
-	$p = $self->{CLASS_PROBS}[$i];
+	$w = $self->{CLASS_EXP_WEIGHTS}[$i];
 	# we don't know whether $p > 0
-	$log_p = ($p > 0) ? log($p) : 0;
-	$p_ref = $self->{FREQ}[$i] / $self->{NR_EVENTS};
+	$log_w = $self->{CLASS_LOG_WEIGHTS}[$i];
+	$w_ref = $self->{FREQ}[$i];
 	# we know that $p_ref > 0
-	$log_p_ref = log($p_ref);
-	$self->{H_p} -= $p * $log_p;
-	$self->{H_cross} -= $p_ref * $log_p;
-	$self->{KL} += $p_ref * ($log_p_ref - $log_p);
-	$self->{H_p_ref} -= $p_ref * $log_p_ref;
-	if ($p == 0) {
+	$log_w_ref = log($w_ref);
+	# update the sums
+	$self->{H_p} -= $w * $log_w;
+	$self->{H_cross} -= $w_ref * $log_w;
+	$self->{KL} += $w_ref * ($log_w_ref - $log_w);
+	$self->{H_p_ref} -= $w_ref * $log_w_ref;
+	if ($w == 0) {
 	    $self->log("entropies: skipping event $i (p^n($i) = 0)\n");
 	}
     }
+    # normalise
+    $self->{H_p} = $self->{H_p} / $self->{Z} + log($self->{Z});
+    $self->{H_cross} = $self->{H_cross} / $self->{NR_EVENTS} + log($self->{Z});
+    $self->{KL} = $self->{KL} / $self->{NR_EVENTS} - log($self->{NR_EVENTS}) +
+	log($self->{Z});
+    $self->{H_p_ref} = $self->{H_p_ref} / $self->{NR_EVENTS} + log($self->{NR_EVENTS});
     $self->{L} = -$self->{H_cross};
-}
-
-
-# for GIS, if f_# is not a constant function
-sub correction_feature {
-    my($self, $bitvec) = @_;
-
-    my($i,
-       $sum);
-
-    $sum = 0;
-    for ($i = 0; $i < $self->{NR_FEATURES}; $i++) {
-	$sum += $bitvec->bit_test($i);
-    }
-    return($self->{M} - $sum);
 }
 
 
@@ -835,25 +779,15 @@ sub weight {
 	$sum);
 
     $sum = 0;
-    for ($f = 0; $f < $self->{NR_FEATURES}; $f++) {
-	if (!$self->{FEATURE_IGNORE}{$f} &&
-	    $bitvec->bit_test($f)) {
+    for $f ($bitvec->indices()) {
+	if (!$self->{FEATURE_IGNORE}{$f}) {
 	    $sum += $self->{PARAMETERS}[$f];
 	}
     }
-    if ($self->{NEED_CORRECTION_FEATURE}) {
-	$sum += $self->correction_feature($bitvec) *
-	    $self->{CORRECTION_PARAMETER};
+    if ($self->{NEED_CORRECTION_FEATURE} && ($self->{SCALER} eq "gis")) {
+	$sum += ($self->{M} - $bitvec->Norm()) * $self->{CORRECTION_PARAMETER};
     }
     return(exp($sum));
-}
-
-
-# computes the probability of a bitvector
-sub prob {
-    my($self, $bitvec) = @_;
-
-    return($self->weight($bitvec) / $self->{Z});
 }
 
 
@@ -863,48 +797,38 @@ sub prob {
 sub A {
     my($self) = @_;
 
-    my($j, 
+    my($f,
        $m,
+       $x,
+       $weight,
+       $vec,
        $class);
 
-    for  ($j = 0; $j < $self->{NR_FEATURES}; $j++) {
-	for ($m = 0; $m <= $self->{M}; $m++) {
-	    if ($m == 0) {
-		$self->{A}[0][$j] = -$self->{E_REF}[$j];
+    undef $self->{A};
+    undef $self->{C};
+    if ($self->{SAMPLING} eq "enum") {
+	undef $self->{Z};
+	$vec = $VECTOR_PACKAGE->new($self->{NR_FEATURES});
+	for ($x = 0; $x < 2 ** $self->{NR_FEATURES}; $x++) {
+	    $weight = $self->weight($vec);
+	    for $f ($vec->indices()) {
+		$self->{A}{$vec->Norm()}{$f} += $weight;
+		$self->{C}{$vec->Norm()}{$f}++;
 	    }
-	    else {
-		$self->{A}[$m][$j] = 0;
-		for $class (@{$self->{M_FEATURES_ACTIVE}{$m}}) {
-		    if ($self->{CLASSES}[$class]->bit_test($j)) {
-			$self->{A}[$m][$j] += $self->{CLASS_PROBS}[$class];
-		    }
-		}
-		if ($debug) {
-		    print "a[$m][$j] = $self->{A}[$m][$j]\n";
-		}
+	    $self->{Z} += $weight;
+	    print "Z = $self->{Z}" unless is_float($self->{Z});
+	    $vec->increment();
+	}
+    }
+    else { # mc or corpus
+	for ($class = 0; $class < $self->{NR_CLASSES}; $class++) {
+	    for  $f ($self->{CLASSES}[$class]->indices()) {
+		$self->{A}{$self->{CLASSES}[$class]->Norm()}{$f} += 
+		    $self->{CLASS_EXP_WEIGHTS}[$class];
+		$self->{C}{$self->{CLASSES}[$class]->Norm()}{$f}++;
 	    }
 	}
     }
-}
-
-
-# enumerates complete Omega; do not use if $nr_features is large!
-sub enum {
-    my($self) = @_;
-
-    my($f,
-       $vec);
-
-    $vec = $VECTOR_PACKAGE->new($self->{NR_FEATURES});
-    for ($f = 0; $f < 2 ** $self->{NR_FEATURES}; $f++) {
-	push @{$self->{CLASSES}}, $vec;
-	push @{$self->{FREQ}}, 1;
-	$vec++;
-    }
-    $self->{NR_CLASSES} = 2 ** $self->{NR_FEATURES};
-    $self->{NR_EVENTS} = $f;
-    $self->{PARAMETERS_CHANGED} = 1;
-    $self->{CLASSES_CHANGED} = 1;
 }
 
 
@@ -941,9 +865,10 @@ sub mc {
     $state->Fill();
     $events{$state->to_Bin()}++;
     $state->Empty();
-    $weight = 1;
-    # iterate 
+    $weight = 0;
+    # iterate
     $k = 0;
+
     do {
 	$old_weight = $weight;
 	if ($state->bit_flip($k)) {
@@ -957,15 +882,23 @@ sub mc {
 	    $state->bit_flip($k);
 	    $weight = $old_weight;
 	}
-	$events{$state->to_Bin()}++;
+	else { # add state
+	    $events{$state->to_Bin()}++;
+	}
+	if ($debug) {
+	    print $state->to_Bin(),"\t",scalar(keys(%events)),"\t$R\n";
+	}
 	# next component
 	$k = ($k + 1) % $self->{NR_FEATURES};
-    } until (scalar(keys(%events)) == $SAMPLE_size);
+    } until ((scalar(keys(%events)) == $SAMPLE_size) ||
+	(scalar(keys(%events)) == 2 ** $self->{NR_FEATURES}));
+
     for (keys(%events)) {
-	push @{$self->{CLASSES}}, $VECTOR_PACKAGE->new_Bin($self->{NR_FEATURES}, $_);
+	push @{$self->{CLASSES}}, 
+	 $VECTOR_PACKAGE->new_Bin($self->{NR_FEATURES}, $_);
     }
     $self->{NR_CLASSES} = scalar(keys(%events)) - 1;
-	
+
     $self->{CLASSES_CHANGED} = 1;
     $self->{PARAMETERS_CHANGED} = 1;
 }
@@ -974,44 +907,79 @@ sub mc {
 #
 # IIS
 #
-sub a_func {
-    my($self, $j, $x, $e_x) = @_;
+
+# Newton estimation according to (Abney 1997), Appendix B
+sub C_func {
+    my($self, $j, $x) = @_;
+
+    my($m,
+       $s0,
+       $s1,
+       $a_x_m);
+
+    $s0 = - $self->{NR_EVENTS} * $self->{E_REF}[$j];
+    $s1 = 0;
+    for ($m = 1; $m <= $self->{M}; $m++) {
+	if ($self->{"C"}{$m}{$j}) {
+	    $a_x_m = $self->{"C"}{$m}{$j} * exp($x * $m);
+	    $s0 += $a_x_m;
+	    $s1 += $m * $a_x_m;
+	}
+    }
+    print "sum_func not a number: $s0\n"
+	unless is_float($s0);
+    print "sum_deriv not a number: $s1\n"
+	unless is_float($s1);
+
+    if ($s1 == 0) {
+	return(0);
+    }
+    else {
+	return($s0 / $s1);
+    }
+}
+
+
+# Newton estimation according to (Della Pietra et al. 1997)
+sub A_func {
+    my($self, $j, $x) = @_;
 
     my($m,
        $sum_func,
        $sum_deriv,
        $a_x_m);
 
-    $sum_func = $self->{"A"}[0][$j];
+    $sum_func = -$self->{E_REF}[$j] * $self->{Z};
     $sum_deriv = 0;
     for ($m = 1; $m <= $self->{M}; $m++) {
-	if ($self->{"A"}[$m][$j] != 0) {
-	    if ($e_x) {
-		$a_x_m = $self->{"A"}[$m][$j] * ($x ** $m);
-	    }
-	    else {
-		$a_x_m = $self->{"A"}[$m][$j] * exp($x * $m);
-	    }
+	if ($self->{"A"}{$m}{$j}) {
+	    $a_x_m = $self->{"A"}{$m}{$j} * exp($x * $m);
 	    $sum_func += $a_x_m;
 	    $sum_deriv += $m * $a_x_m;
 	}
     }
-    return($sum_func, $sum_deriv);
+    if ($sum_deriv == 0) {
+	return(0);
+    }
+    else {
+	return($sum_func / $sum_deriv);
+    }
 }
 
 
 # solves \alpha from 
 # \sum_{m=0}^{M} a_{m,j}^{(n)} e^{\alpha^{(n)}_j m}=0
 sub iis_estimate_with_newton {
-    my($self, $i, $e_x) = @_;
+    my($self, $i) = @_;
 
-    my($x, 
+    my($x,
        $old_x,
        $deriv_res,
        $func_res,
        $k);
 
-    $x = 1;
+    # $x  = log(0)
+    $x = 0;
     $k = 0;
 
     # do newton's method
@@ -1019,28 +987,47 @@ sub iis_estimate_with_newton {
 	# save old x
 	$old_x = $x;
 	# compute new x
-	($func_res, $deriv_res) = $self->a_func($i, $x, $e_x);
-	if (($deriv_res eq 'NaN') || ($deriv_res == 0) ||
-	    ($deriv_res eq 'Infinity')) {
-	    print "a_deriv($i, $x) = $deriv_res\n";
+	if ($self->{SAMPLING} eq "enum") {
+	    # (DDL 1997)
+	    $x -= $self->A_func($i, $x);
 	}
-	if (($func_res eq 'NaN') || ($func_res eq 'Infinity') ||
-	    ($func_res == 0)) {
-	    print "a_func($i, $x) = $func_res\n";
-	}
-	$x -= ($func_res / $deriv_res);
-	if ($x eq 'NaN') {
-	    print "$func_res / $deriv_res = NaN\n";
-	    print "feature $i will be ignored in future iterations\n";
-	    $self->{FEATURE_IGNORE}{$i} = 1;
-	    return(0);
+	else {
+	    # sample -> (Abney 1997)
+	    $x -= $self->A_func($i, $x);
 	}
     } until ((abs($x - $old_x) <= $NEWTON_min) ||
 	     ($k++ > $NEWTON_max_it));
     if ($debug) {
 	print "Estimated gamma_$i with Newton's method: $x\n";
     }
-    return($e_x ? log($x) : $x);
+    return($x);
+}
+
+
+# updates parameter $i
+sub gamma {
+    my($self, $sample) = @_;
+
+    my($f);
+
+    for $f (0..$self->{NR_FEATURES} - 1) {
+	if (!$self->{FEATURE_IGNORE}{$f}) {
+	    if ($self->{SCALER} eq "gis") {
+		$self->{PARAMETERS}[$f] +=
+		    log($self->{E_REF}[$f] / $sample->{E_LOGLIN}[$f]) / $sample->{M};
+	    }
+	    else {
+		$self->{PARAMETERS}[$f] +=
+		    $sample->iis_estimate_with_newton($f);
+	    }
+	}
+    }
+
+    if (($self->{SCALER} eq "gis") && ($self->{NEED_CORRECTION_FEATURE})) {
+	$self->{CORRECTION_PARAMETER} +=
+	    log($self->{E_REF}[$self->{NR_FEATURES}] / 
+		$sample->{E_LOGLIN}[$self->{NR_FEATURES}]) / $self->{M};
+    }
 }
 
 
@@ -1063,11 +1050,9 @@ sub scale {
     if ($scaler) {
 	$self->{SCALER} = $scaler;
     }
+
     $self->init_parameters();
     $self->prepare_model();
-    if ($self->{SAMPLING} eq "enum") {
-	$sample = $self->sample();
-    }
     $self->log("($self->{SCALER}, $self->{SAMPLING}): H(p_ref)=$self->{H_p_ref}\nit.\tD(p_ref||p)\t\tH(p)\t\t\tL(p_ref,p)\t\ttime\n0\t$self->{KL}\t$self->{H_p}\t$self->{L}\t" . time() . "\n");
     $k = 0;
     $kl = 1e99;
@@ -1075,31 +1060,11 @@ sub scale {
 	# store parameters for reverting if converging stops
 	@old_parameters = @{$self->{PARAMETERS}};
 	$old_correction_parameter = $self->{CORRECTION_PARAMETER};
-	if ($self->{SAMPLING} ne "enum") { 
-	    if ($sample) {
-		$sample->DESTROY();
-	    }
-	    $sample = $self->sample();
+	if ($sample) {
+	    $sample->DESTROY();
 	}
-	$sample->prepare_model();
-	for ($i = 0; $i < $self->{NR_FEATURES}; $i++) {
-	    if (!$self->{FEATURE_IGNORE}{$i} && !$sample->{FEATURE_IGNORE}{$i}) {
-		if ($self->{SCALER} eq "gis") {
-		    $self->{PARAMETERS}[$i] *= ($self->{E_REF}[$i] / 
-			$sample->{E_LOGLIN}[$i]) ** (1 / $self->{M});
-		}
-		else {
-		    $self->{PARAMETERS}[$i] += 
-			$sample->iis_estimate_with_newton($i);
-		}
-	    }
-	}
-	if (($self->{SCALER} eq "gis") && ($self->{NEED_CORRECTION_FEATURE})) {
-	    $self->{CORRECTION_PARAMETER} *=
-		($self->{E_REF}[$self->{NR_FEATURES}] / 
-		 $sample->{E_LOGLIN}[$self->{NR_FEATURES}]) ** 
-		     (1 / $self->{M});
-	}
+	$sample = $self->sample();
+	$self->gamma($sample);
 	$self->{PARAMETERS_CHANGED} = 1;
 	$self->prepare_model();
 	$diff = $kl - $self->{KL};
@@ -1122,9 +1087,7 @@ sub scale {
 	    $self->dump();
 	    $cntrl_backslash_pressed = 0;
 	}
-    } until ($diff <= $KL_min || 
-	     ($k > $KL_max_it) ||
-	     ($diff < 0));
+    } until ($diff <= $KL_min || ($k > $KL_max_it) || ($diff < 0));
 }
 
 
@@ -1222,20 +1185,20 @@ sub gain {
 	    $sum_p = 0;
 	    for ($x = 0; $x < $self->{NR_CLASSES}; $x++) {
 		if ($candidates->{CANDIDATES}[$x]->bit_test($c)) {
-		    $sum_p += $self->{CLASS_PROBS}[$x];
+		    $sum_p += $self->{CLASS_EXP_WEIGHTS}[$x];
 		    $sum_p_ref += $self->{FREQ}[$x];
 		}
 	    }
+	    $sum_p /= $self->{Z};
 	    $sum_p_ref /= $self->{NR_EVENTS};
 	    $above = $sum_p_ref * (1 - $sum_p);
 	    $below = $sum_p * (1 - $sum_p_ref);
-	    if ((($above > 0) && ($below > 0)) || (($above < 0) && ($below < 0))) {
-		$candidates->{ALPHA}[$c] = log(abs($above)) - log(abs($below));
+	    if ($above * $below > 0) {
+		$candidates->{ALPHA}[$c] = log($above / $below);
 	    }
 	    else {
 		$self->die("Cannot take log of negative/zero value: $above / $below\n");
 	    }
-	    
 	    # temporarily add feature to classes and compute $gain
 	    $kl = $self->{KL};
 	    $self->add_feature($candidates, $c);
@@ -1681,6 +1644,11 @@ event space as soon as possible after the first iteration it finishes.
 
 =over 4
 
+=item (Abney 1997)
+
+Steven P. Abney, Stochastic Attribute Value Grammar, Computational
+Linguistics 23(4).
+
 =item (Darroch and Ratcliff 1972) 
 
 J. Darroch and D. Ratcliff, Generalised Iterative Scaling for
@@ -1708,7 +1676,7 @@ and Machine Intelligence, 19(4), April 1997.
 
 =head1 VERSION
 
-Version 0.7.
+Version 0.8.
 
 
 =head1 AUTHOR
@@ -1718,6 +1686,12 @@ Version 0.7.
 Hugo WL ter Doest, terdoest@cs.utwente.nl
 
 =end roff
+
+=begin text
+
+Hugo WL ter Doest, terdoest@cs.utwente.nl
+
+=end text
 
 =begin latex
 

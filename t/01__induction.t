@@ -1,4 +1,5 @@
 #!/Utils/bin/perl5
+#!/usr/bin/perl
 
 print "1..5\n";
 $i=1;
@@ -10,7 +11,7 @@ use Statistics::MaxEntropy qw($debug
 			      $KL_min
 			      $SAMPLE_size);
 
-use Statistics::Candidates qw(write);
+use Statistics::Candidates;
 
 use vars qw($scaling
 	    $sampling
@@ -54,7 +55,6 @@ for $sampling ("corpus", "enum") {
     for $scaling ("gis", "iis") {
 	$candidates->clear();
 	$events->clear();
-	$events = Statistics::MaxEntropy->undump($dump_file_1);
 	$events->fi($scaling, $candidates, 2, $sampling);
 	print "ok $i\n";
 	$i++;

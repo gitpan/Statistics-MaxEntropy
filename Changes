@@ -3,7 +3,7 @@ Revision history for Perl extension Statistics::MaxEntropy.
 0.4  Fri Jun 26 21:41:41 1998
 	- original version; created by h2xs 1.16
 	  at that time named Stat::ME
-0.5  ...
+0.5  ... Jul 3 9:32:00 1998
 	- first version uploaded to CPAN
 0.6  Tue Jul 13 12:00:12 1998
 	- improved test.pl by adding input files that work
@@ -27,4 +27,12 @@ Revision history for Perl extension Statistics::MaxEntropy.
 	  like Bit::Vector
 	- Candidates.pm and MaxEntropy.pm are configurable for choosing between
 	  Statistics::SparseVector and Bit::Vector.
+0.9  Sun Nov 21 20:03:21 1998
+	- enumeration of event space no longer stored in memory
+	- implemented Newton iteration (IIS) according to (Abney 1997)
+	- removed support for Bit::Vector; SparseVector runs the show now
+	- 
 	
+
+
+

@@ -1,5 +1,6 @@
 Changes
 MANIFEST
+README
 INSTALL.txt
 MaxEntropy.pm
 Candidates.pm
@@ -12,6 +13,7 @@ data/events.txt
 data/candidates.txt
 TeX/root.tex
 TeX/makedoc
+TeX/makeREADME
 t/00____scaling.t
 t/01__induction.t
 t/02_____sparse.t

@@ -10,3 +10,8 @@ cd TeX
 latex root
 rm -rf ../MaxEntropy.pm.tex ../Candidates.pm.tex ../ME.wrapper.pl.tex ../SparseVector.pm.tex
 dvips -o MaxEnt.ps root
+
+cd ..
+rm README
+pod2text MaxEntropy.pm > README
+cd TeX

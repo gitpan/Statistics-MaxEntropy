@@ -79,8 +79,9 @@ sub Clone {
     my($new);
 
     $new = Statistics::SparseVector->new($self->{N});
+    bless $new, ref($self);
     for (keys %{$self->{VECTOR}}) {
-	$new->{VECTOR}->{$_} = $self->{VECTOR}->{$_};
+	$new->{VECTOR}{$_} = $self->{VECTOR}{$_};
     }
     return($new);
 }
@@ -104,7 +105,7 @@ sub new_Bin {
     $i = 0;
     while ($bitvector) {
 	if (chop($bitvector) eq "1") {
-	    $self->{VECTOR}->{$i} = 1;
+	    $self->{VECTOR}{$i} = 1;
 	}
 	$i++;
     }
@@ -116,7 +117,7 @@ sub new_Bin {
 sub bit_test {
     my($self, $i) = @_;
 
-    return(defined($self->{VECTOR}->{$i}));
+    return(defined($self->{VECTOR}{$i}));
 }
 
 
@@ -124,7 +125,7 @@ sub bit_test {
 sub Bit_Off {
     my($self, $i) = @_;
 
-    undef $self->{VECTOR}->{$i};
+    undef $self->{VECTOR}{$i};
 }
 
 
@@ -132,7 +133,7 @@ sub Bit_Off {
 sub Bit_On {
     my($self, $i) = @_;
 
-    $self->{VECTOR}->{$i} = 1;
+    $self->{VECTOR}{$i} = 1;
 }
 
 
@@ -141,11 +142,11 @@ sub Bit_On {
 sub bit_flip {
     my($self, $i) = @_;
 
-    if (defined($self->{VECTOR}->{$i})) {
-	undef $self->{VECTOR}->{$i};
+    if (defined($self->{VECTOR}{$i})) {
+	undef $self->{VECTOR}{$i};
     }
     else {
-	$self->{VECTOR}->{$i} = 1;
+	$self->{VECTOR}{$i} = 1;
     }
 }
 
@@ -159,12 +160,12 @@ sub increment {
     $carry = 0;
     $i = 0;
     do {
-	if ($self->{VECTOR}->{$i}) {
-	    undef $self->{VECTOR}->{$i};
+	if ($self->{VECTOR}{$i}) {
+	    undef $self->{VECTOR}{$i};
 	    $carry = 1;
 	}
 	else {
-	    $self->{VECTOR}->{$i} = 1;
+	    $self->{VECTOR}{$i} = 1;
 	    $carry = 0;
 	}
 	$i++;
@@ -179,7 +180,7 @@ sub Fill {
     my $i;
 
     for ($i = 0; $i < $self->{N}; $i++) {
-	$self->{VECTOR}->{$i} = 1;
+	$self->{VECTOR}{$i} = 1;
     }
 }
 
@@ -196,15 +197,15 @@ sub Empty {
 sub to_Bin {
     my($self) = @_;
 
-    my($i, $s);
+    my($s, $i);
 
     $s = "";
     for ($i = 0; $i < $self->{N}; $i++) {
-	if ($self->{VECTOR}->{$i}) {
-	    $s = "1" . $s;
+	if (defined($self->{VECTOR}{$i})) {
+	    $s = "1$s";
 	}
 	else {
-	    $s = "0" . $s;
+	    $s = "0$s";
 	}
     }
     return($s);
@@ -227,7 +228,7 @@ sub new_Enum {
 
     $self = $this->new($n);
     for (split(/,/,$s)) {
-	$self->{VECTOR}->{$_} = 1
+	$self->{VECTOR}{$_} = 1
     }
     return($self);
 }
@@ -266,20 +267,51 @@ sub Interval_Substitute {
     # copy the new bits from the source $vec1
     if (defined($vec1)) { # we have source bits
 	for ($i = $off2; $i < $off2 + $len1; $i++) {
-	    $vec2->{VECTOR}->{$i} = $vec1->{VECTOR}->{$i - $off2 + $off1};
+	    if (defined($vec1->{VECTOR}{$i - $off2 + $off1})) {
+		$vec2->{VECTOR}{$i} = $vec1->{VECTOR}{$i - $off2 + $off1};
+	    }
+	    else {
+		undef $vec2->{VECTOR}{$i};
+	    }
 	}
     }
     # append the rest of $oldvec2
     # index $i runs for $oldvec2, we correct for $vec2
     for ($i = $off2 + $len2; $i < $oldvec2->{N}; $i++) {
-	$vec2->{VECTOR}->{$i-$len2+$len1} = $oldvec2->{VECTOR}->{$i};
+	if (defined($oldvec2->{VECTOR}{$i})) {
+	    $vec2->{VECTOR}{$i-$len2+$len1} = $oldvec2->{VECTOR}{$i};
+	}
+	else {
+	    undef $vec2->{VECTOR}{$i-$len2+$len1};
+	}
     }
+    undef $oldvec2;
+}
+
+
+# returns an array of indices of set bits
+sub indices {
+    my($self) = @_;
+
+    return(grep($self->{VECTOR}{$_}, keys(%{$self->{VECTOR}})));
+}
+
+
+# the number of bits that are on
+sub Norm {
+    my($self) = @_;
+
+    my(@a);
+
+    @a = $self->indices();
+    return($#a + 1);
 }
 
 
 # Autoload methods go after =cut, and are processed by the autosplit program.
 
 1;
+
 __END__
 
 # Below is the stub of documentation for your module. You better edit it!
@@ -287,7 +319,7 @@ __END__
 
 =head1 NAME
 
-Statistics::SparseVector - Perl extension for manipulating sparse bitvectors
+Statistics::SparseVector - Perl5 extension for manipulating sparse bitvectors
 
 =head1 SYNOPSIS
 
@@ -296,8 +328,8 @@ Statistics::SparseVector - Perl extension for manipulating sparse bitvectors
  # methods that create new bitvectors
  $vec = Statistics::SparseVector->new($n);
  $vec2 = $vec1->Clone();
- $vec = Statistics::SparseVector->new_Enum($s);
- $vec = Statistics::SparseVector->new_Bin($s);
+ $vec = Statistics::SparseVector->new_Enum($s, $n);
+ $vec = Statistics::SparseVector->new_Bin($s, $n);
 
  # miscellaneous
  $vec2->Substitute_Vector($vec1, $of22, $len2, $off1, $len1);
@@ -307,6 +339,8 @@ Statistics::SparseVector - Perl extension for manipulating sparse bitvectors
  $vec->Fill();
  $vec->Empty();
  $vec->increment();
+ $n = $vec->Norm();
+ @list = $vec->indices();
 
  # manipulation on the bit level
  $vec->Bit_Off($i);
@@ -336,11 +370,28 @@ can easily switch to a less memory consuming representation.
 
 =item C<new>
 
+ $vec = Statistics::BitVector->new($n);
+
+A bitvector of length C<$n> is created. All bits are zero.
+
 =item C<Clone>
+
+ $clone = $vec->Clone();
+
+A copy of C<$vec> is returned.
 
 =item C<new_Enum>
 
+ $vec = Statistics::BitVector->new_Enum($enumstring, $n);
+
+A new bitvector of length C<$n> is created from the comma-separated list of in
+C<$enumstring>.
+
 =item C<new_Bin>
+
+ $vec = Statistics::BitVector->new_Bin($bitstring, $n);
+
+A new bitvector of length C<$n> is created from bitstring C<$bitstring>.
 
 =back
 
@@ -351,19 +402,54 @@ can easily switch to a less memory consuming representation.
 
 =item C<Substitute_Vector>
 
+ $vec2->Substitute_Vector($vec1, $off2, $len2, $off1, $len1);
+
+C<$len2> contiguous bits in target vector C<$vec2> starting from C<$off2> are
+replaced by C<$len1> contiguous bits from source vector C<$vec1> starting at bit
+C<$off1>. If C<$off2> equals the length of C<$vec2> the bits from C<$vec1> are
+appended. If C<$len1> is zero the C<$len2> bits from C<$vec2> are deleted.
+
 =item C<Fill>
+
+ $vec->Fill();
+
+All bits of C<$vec> are set to one.
 
 =item C<Empty>
 
+ $vec->Empty();
+
+All bits of C<$vec> are set to zero.
+
 =item C<increment>
+
+ $vec->increment(); $vec++;
+
+The integer value of the bitvector is increased by one.
 
 =item C<Bit_Off>
 
+ $vec->Bit_Off($i);
+
+Bit C<$i> is set to zero.
+
 =item C<Bit_On>
+
+ $vec->Bit_On($i);
+
+Bit C<$i> is set to one.
 
 =item C<bit_flip>
 
+ $vec->bit_flip($i);
+
+Bit C<$i> is flipped.
+
 =item C<bit_test>
+
+ $vec->bit_test($i);
+
+Returns C<1> if bit C<$i> is one, C<0> otherwise.
 
 =back
 
@@ -374,11 +460,29 @@ can easily switch to a less memory consuming representation.
 
 =item C<Size>
 
-=item C<to_Enum>
+ $n = $vec->Size();
+
+Returns the size of the vector.
 
 =item C<to_Enum>
+
+ $enumstring = $vec->to_Enum();
+
+Returns a comma-separated list of bits that are set.
+
+=item C<indices>
+
+Returns an array of indices of bits that are set.
 
 =item C<to_Bin>
+
+ $bitstring = $vec->to_Bin();
+
+Returns a bitstring; bits should be read from right to left.
+
+=item C<Norm>
+
+Returns the number of set bits.
 
 =back
 
@@ -389,7 +493,18 @@ can easily switch to a less memory consuming representation.
 
 =item C<++>
 
+ $vec++;
+
+Same as method C<increment>.
+
 =item Double quotes
+
+ $string = "$vec";
+
+C<Data::Dumper> wants to stringify vectors. Probably because
+C<Statistics::SparseVector> is an overloaded package it expects double quotes to
+be overloaded as well.
+
 
 =back 
 

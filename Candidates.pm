@@ -31,8 +31,7 @@ package Statistics::Candidates;
 use vars qw($VERSION
 	    @ISA
 	    @EXPORT
-	    $VECTOR_PACKAGE
-	    $SPARSE);
+	    $VECTOR_PACKAGE);
 
 
 ##---------------------------------------------------------------------------##
@@ -41,15 +40,8 @@ use vars qw($VERSION
 use strict;
 use diagnostics -verbose;
 use Carp;
-$SPARSE = 1;
-if ($SPARSE) {
-    $VECTOR_PACKAGE = "Statistics::SparseVector";
-    use Statistics::SparseVector;
-}
-else {
-    $VECTOR_PACKAGE = "Bit::Vector";
-    use Bit::Vector;
-}
+use Statistics::SparseVector;
+$VECTOR_PACKAGE = "Statistics::SparseVector";
 require Exporter;
 require AutoLoader;
 
@@ -57,9 +49,7 @@ require AutoLoader;
 # Items to export into callers namespace by default. Note: do not export
 # names by default without a very good reason. Use EXPORT_OK instead.
 # Do not simply export all your public functions/methods/constants.
-@EXPORT = qw(new
-	     DESTROY
-	     write
+@EXPORT = qw(
 	     );
 
 
@@ -320,8 +310,7 @@ C<f_ij> are bits:
 
 =head1 SEE ALSO
 
-L<Statistics::MaxEntropy>, L<Statistics::SparseVector>,
-L<Bit::Vector>.
+L<Statistics::MaxEntropy>, L<Statistics::SparseVector>..
 
 
 =head1 VERSION
