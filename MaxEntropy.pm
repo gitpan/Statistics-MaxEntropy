@@ -3,9 +3,12 @@ package Statistics::MaxEntropy;
 ##---------------------------------------------------------------------------##
 ##  Author:
 ##      Hugo WL ter Doest       terdoest@cs.utwente.nl
-##  Description: Statistics::MaxEntropy
-##	Improved Iterative Scaling algorithm and 
+##  Description:
+##      Object-oriented implementation of
+##      Generalised Iterative Scaling algorithm, 
+##	Improved Iterative Scaling algorithm, and
 ##      Feature Induction algorithm
+##      for inducing maximum entropy probability distributions
 ##  Keywords:
 ##      Maximum Entropy Modeling
 ##      Kullback-Leibler Divergence
@@ -14,20 +17,40 @@ package Statistics::MaxEntropy;
 ##---------------------------------------------------------------------------##
 ##  Copyright (C) 1998 Hugo WL ter Doest terdoest@cs.utwente.nl
 ##
-##  This program is free software; you can redistribute it and/or modify
+##  This library is free software; you can redistribute it and/or modify
 ##  it under the terms of the GNU General Public License as published by
 ##  the Free Software Foundation; either version 2 of the License, or
 ##  (at your option) any later version.
 ##
-##  This program is distributed in the hope that it will be useful,
+##  This library  is distributed in the hope that it will be useful,
 ##  but WITHOUT ANY WARRANTY; without even the implied warranty of
 ##  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 ##  GNU General Public License for more details.
 ##
-##  You should have received a copy of the GNU General Public License
-##  along with this program; if not, write to the Free Software
+##  You should have received a copy of the GNU Library General Public 
+##  License along with this program; if not, write to the Free Software
 ##  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
 ##---------------------------------------------------------------------------##
+
+
+##---------------------------------------------------------------------------##
+##	Globals
+##---------------------------------------------------------------------------##
+use vars qw($VERSION
+	    @ISA
+	    @EXPORT
+	    $SPARSE
+	    $VECTOR_PACKAGE
+
+	    $debug
+	    $SAMPLE_size
+	    $NEWTON_max_it
+	    $KL_max_it
+	    $KL_min
+	    $NEWTON_min
+	    $cntrl_c_pressed
+	    $cntrl_backslash_pressed
+	    );
 
 
 ##---------------------------------------------------------------------------##
@@ -35,47 +58,18 @@ package Statistics::MaxEntropy;
 ##---------------------------------------------------------------------------##
 use strict;
 use diagnostics -verbose;
-use Bit::Vector;
-# for floor and ceil functions
+$SPARSE = 1;
+if ($SPARSE) {
+    $VECTOR_PACKAGE = "Statistics::SparseVector";
+    use Statistics::SparseVector;
+}
+else {
+    $VECTOR_PACKAGE = "Bit::Vector";
+    use Bit::Vector;
+}
 use POSIX;
-
-
-##---------------------------------------------------------------------------##
-##	Globals
-##---------------------------------------------------------------------------##
-use vars qw($VERSION 
-	    @ISA 
-	    @EXPORT 
-	    @events 
-	    $nr_events
-	    $nr_features
-	    @candidates
-	    $nr_candidates
-	    @pars
-	    @p
-	    @p_ref
-	    $Z
-	    $M
-	    @nr_feats_on
-	    @a
-	    $normalise
-	    @E_ref
-	    $debug
-	    $NEWTON_max_it
-	    $KL_max_it
-	    $KL_min
-	    $NEWTON_min
-	    %is_added
-	    $rand_max_features
-	    $rand_max_candidates
-	    @correction_feature
-	    $correction_parameter
-	    );
-
-use subs qw(GIS
-	    IIS
-	    );
-
+use Carp;
+use Data::Dumper;
 require Exporter;
 require AutoLoader;
 
@@ -83,1073 +77,1226 @@ require AutoLoader;
 # Items to export into callers namespace by default. Note: do not export
 # names by default without a very good reason. Use EXPORT_OK instead.
 # Do not simply export all your public functions/methods/constants.
-@EXPORT = qw(
-	     $KL_min
+@EXPORT = qw($KL_min
 	     $NEWTON_min
 	     $debug
-	     $normalise
 	     $nr_add
 	     $KL_max_it
 	     $NEWTON_max_it
-	     $rand_max_features
-	     $rand_max_candidates
-	     init
-	     random_init
-	     done
-	     IIS
-	     GIS
-	     FI
-);
+	     $SAMPLE_size
 
-$VERSION = '0.5';
-$normalise = 1;
+	     new
+	     DESTROY
+	     write
+	     scale
+	     dump
+	     undump
+	     
+	     fi
+	     random_parameters
+	     set_parameters_to
+	     write_parameters
+	     write_parameters_with_names
+	     );
+
+$VERSION = '0.8';
+
+
+# default values for some configurable parameters
 $NEWTON_max_it = 200;
 $NEWTON_min = 0.001;
 $KL_max_it = 100;
 $KL_min = 0.001;
-$rand_max_candidates = 20;
-$rand_max_features = 20;
 $debug = 0;
+$SAMPLE_size = 250; # the size of MC samples
+$cntrl_c_pressed = 0;
+$cntrl_backslash_pressed = 0;
+$SIG{INT} = \&catch_cntrl_c;
+$SIG{QUIT} = \&catch_cntrl_backslash;
 
-##---------------------------------------------------------------------------##
-##	Private routines
-##---------------------------------------------------------------------------##
+
+# interrrupt routine for control c
+sub catch_cntrl_c {
+    my($signame) = shift;
+
+    $cntrl_c_pressed = 1;
+    die "<CONTROL-C> pressed\n";
+}
 
 
-##	I/O routines
+# interrrupt routine for control \ (originally core-dump request)
+sub catch_cntrl_backslash {
+    my($signame) = shift;
 
-# reads an events file
-# dies in case of inconsistent lines
-sub read_events {
-    my($file) = shift;
-    my $features;
-    my $sum = 0;
-    my $i;
+    $cntrl_backslash_pressed = 1;
+}
 
-    open(EVENTS,$file) ||
-	die "Could not open $file\n";
+
+# creates a new event space
+# depending on the $arg parameter samples it or reads it from a file
+sub new {
+    my($this, $arg) = @_;
+
+    # for calling $self->new($someth):
+    my $class = ref($this) || $this;
+    my $self = {};
+    bless $self, $class;
+    $self->{SCALER} = "gis"; # default
+    $self->{SAMPLING} = "corpus"; # default
+    $self->{NR_CLASSES} = 0;
+    $self->{NR_EVENTS} = 0;
+    $self->{NR_FEATURES} = 0;
+    if ($arg) { # hey a filename
+	$self->read($arg);
+    }
+    return($self);
+}
+
+
+# decides how to sample, "enum", "mc", or "corpus"
+sub sample {
+    my($self) = @_;
+
+    my($sample);
+
+    if ($self->{SAMPLING} eq "mc") {
+	$sample = $self->new();
+	$sample->{SCALER} = $self->{SCALER};
+	$sample->{NR_FEATURES} = $self->{NR_FEATURES};
+	# refer to the parameters of $self
+	$sample->{PARAMETERS} = $self->{PARAMETERS};
+	$sample->{CORRECTION_PARAMETER} = $self->{CORRECTION_PARAMETER};
+	$sample->{E_REF} = $self->{E_REF};
+	$sample->{THIS_IS_A_SAMPLE} = 1;
+	$sample->mc($self);
+	$self->prepare_model();
+    }
+    elsif ($self->{SAMPLING} eq "enum") {
+	$sample = $self->new();
+	$sample->{SCALER} = $self->{SCALER};
+	$sample->{NR_FEATURES} = $self->{NR_FEATURES};
+	$sample->{PARAMETERS} = $self->{PARAMETERS};
+	$sample->{CORRECTION_PARAMETER} = $self->{CORRECTION_PARAMETER};
+	$sample->{E_REF} = $self->{E_REF};
+	$sample->{THIS_IS_A_SAMPLE} = 1;
+	$sample->enum();
+	$sample->prepare_model();
+    }
+    else { # taken to be "corpus"
+	$sample = $self;
+    }
+    return($sample);
+}
+
+
+# makes sure that when prepare_model is called, everything is recomputed
+sub clear {
+    my($self) = @_;
+    
+    undef $self->{PARAMETERS_INITIALISED};
+    $self->{PARAMETERS_CHANGED} = 1;
+    $self->{CLASSES_CHANGED} = 1;
+}
+
+
+
+sub DESTROY {
+    my($self) = @_;
+    
+    if ($cntrl_c_pressed) {
+	$self->dump();
+    }
+}
+
+
+# reads an events file, dies in case of inconsistent lines
+# syntax first line: <name> <tab> <name> <tab> ..... <newline>
+# syntax other lines: <freq> <bitvector> <newline>
+sub read {
+    my($self, $file) = @_;
+
+    my($features,
+       $feature_names);
+
+    $feature_names = "";
+    open(EVENTS, $file) ||
+	$self->die("Could not open $file\n");
     print "Opened $file\n";
-    $nr_events = 0;
-    $nr_features = 0;
+
+    # read the names of the features, skip comment
+    do {
+	$feature_names = <EVENTS>;
+    } until ($feature_names !~ /\#.*/);
+    chomp $feature_names;
+    $self->{FEATURE_NAMES} = [split(/\t/, $feature_names)];
+
+    # read the bitvectors
     while (<EVENTS>) {
 	if (!/\#.*/) {
 	    chomp;
 
-	    ($p_ref[$nr_events],$features) = split;
-	    $sum += $p_ref[$nr_events];
+	    ($self->{FREQ}[$self->{NR_CLASSES}], $features) = split;
+	    if ($self->{FREQ} == 0) {
+		$self->die("Class $self->{NR_CLASSES} has zero probability\n");
+	    }
+	    $self->{NR_EVENTS} += $self->{FREQ}[$self->{NR_CLASSES}];
 
 	    # if first event set nr_features
-	    if ($nr_events == 0) {
-		$nr_features = length($features);
+	    if ($self->{NR_CLASSES} == 0) {
+		$self->{NR_FEATURES} = length($features);
 	    }
 	    # else check nr of features for this event
 	    else {
-		if (length($features) != $nr_features) {
-		    die "Events file corrupt (line $nr_events)\n";
+		if (length($features) != $self->{NR_FEATURES}) {
+		    $self->die("Events file corrupt (class $self->{NR_CLASSES})\n");
 		}
 	    }
 	    # create and initialise bit vector
-	    $events[$nr_events] = Bit::Vector->new_Bin($nr_features,$features);
-	    $nr_events++;
+	    $self->{CLASSES}[$self->{NR_CLASSES}] = 
+	      $VECTOR_PACKAGE->new_Bin($self->{NR_FEATURES}, $features);
+	    $self->{NR_CLASSES}++;
 	}
     }
     close(EVENTS);
 
-    # normalise, if necessary
-    if ($normalise) {
-	normalise_p_ref();
-    }
-
-    print "Read $nr_events events and $nr_features features;\n";
-    print "closed $file\n";
-}
-
-
-# normalises the reference distribution
-sub normalise_p_ref {
-    my ($i, $sum);
-
-    $sum = 0;
-    for ($i = 0; $i < $nr_events; $i++) {
-	$sum += $p_ref[$i];
-	if ($debug) {
-	    print "prob event $i: $p_ref[$i]\n";
-	}
-    }
-    for ($i = 0; $i < $nr_events; $i++) {
-	$p_ref[$i] /= $sum;
-	if ($debug) {
-	    print "prob event $i: $p_ref[$i]\n";
-	}
-    }
-}
-
-
-# reads a candidates file
-# dies if insufficient events or inconsistent lines
-sub read_candidates {
-    my($file) = shift;
-    my $features;
-    my $sum = 0;
-    my $event;
-
-    open(CANDS,$file) ||
-	die "Could not open $file\n";
-    print "Opened $file\n";
-    $nr_candidates = 0;
-    $event = 0;
-    while (<CANDS>) {
-	if (!/\#.*/) {
-	    chomp;
-	    $features = $_;
-	    if ($event == 0) {
-		$nr_candidates = length($features);
-	    }
-	    else {
-		if ($nr_candidates != length($features)) {
-		    die "Candidate file corrupt ".
-			"(line $event has insufficient features)\n";
-		}
-	    }
-	    $candidates[$event++] = 
-	      Bit::Vector->new_Bin($nr_candidates,$features);
-	}
-    }
-    close(CANDS);
-
-    # check the candidates for constant functions
-    check_candidates();
-
-    print "Read $nr_candidates candidates; closed $file\n";
-    if ($nr_events != $event) {
-	die "Candidate file has insufficient events\n";
-    }
-}
-
-
-# writes events to file (in case of new feature(s))
-sub write_candidates {
-    my($file) = shift;
-    my($x,$f);
-
-    open(CANDIDATES,">$file") ||
-	die "Could not open $file\n";
-    print "Opened $file\n";
-    
-    # write candidates that were not added
-    for ($x = 0; $x < $nr_events; $x++) {
-	for ($f = 0; $f < $nr_candidates; $f++) {
-	    if (!$is_added{$f}) {
-		print CANDIDATES $candidates[$x]->bit_test($f);
-	    }
-	}
-	print CANDIDATES "\n";
-    }
-    close CANDIDATES;
+    print "Read $self->{NR_EVENTS} events, $self->{NR_CLASSES} classes, " . 
+	"and $self->{NR_FEATURES} features\n";
     print "Closed $file\n";
-}
 
-
-# initialise parameters randomly
-sub random_parameters {
-    my $i;
-
-    srand();
-    for ($i = 0; $i < $nr_features; $i++) {
-	$pars[$i] = rand();
-    }
-    if ($debug) {
-	print_distr();
-    }
+    $self->{FILENAME} = $file;
+    $self->{CLASSES_CHANGED} = 1;
+    $self->{PARAMETERS_CHANGED} = 1;
 }
 
 
 # reads an initial distribution
+# syntax: one parameter per line
 sub read_parameters {
-    my($file) = shift;
-    my $i = 0;
+    my($self, $file) = @_;
 
+    my($i);
+
+    $i = 0;
     open(DISTR,$file) ||
-	die "Could not open $file\n";
+	$self->die("Could not open $file\n");
     print "Opened $file\n";
+
     while (<DISTR>) {
 	if (!/\#.*/) {
 	    chomp;
-	    $pars[$i++] = $_;
+	    $self->{PARAMETERS}[$i++] = $_;
 	}
     }
+
     close(DISTR);
-    print "Read $nr_features features; closed $file\n";
-    if ($i != $nr_features) {
-	die "Initial distribution file corrupt\n";
+    if ($i != $self->{NR_FEATURES}) {
+	$self->die("Initial distribution file corrupt\n");
+    }
+    print "Read $i parameters; closed $file\n";
+    $self->{PARAMETERS_CHANGED} = 1;
+}
+
+
+# writes the the current parameters
+# syntax: <parameter> <newline>
+sub write_parameters {
+    my($self, $file) = @_;
+
+    my($i);
+
+    open(DISTR,">$file") ||
+	$self->die("Could not open $file\n");
+    print "Opened $file\n";
+
+    for ($i = 0; $i < $self->{NR_FEATURES}; $i++) {
+	if ($self->{FEATURE_IGNORED}{$i}) {
+	    print DISTR "IGNORED\n";
+	}
+	else {
+	    print DISTR "$self->{PARAMETERS}[$i]\n";
+	}
+    }
+
+    close(DISTR);
+    print "Closed $file\n";
+}
+
+
+# writes the the current features with their parameters
+# syntax first line: <$nr_features> <newline>
+# syntax last line: <bitmask> <newline>
+# syntax other lines: <name> <parameter> <newline>
+sub write_parameters_with_names {
+    my($self, $file) = @_;
+
+    my($x,
+       $bitmask);
+
+    open(DISTR,">$file") ||
+	$self->die("Could not open $file\n");
+    print "Opened $file\n";
+
+    print DISTR "$self->{NR_FEATURES}\n";
+    $bitmask = "";
+    for ($x = 0; $x < $self->{NR_FEATURES}; $x++) {
+	print DISTR "$self->{FEATURE_NAMES}[$self->{NR_FEATURES} - $x - 1]\t" .
+	    "$self->{PARAMETERS}[$x]\n";
+	if ($self->{FEATURE_IGNORED}{$x}) {
+	    $bitmask .= "0";
+	}
+	else {
+	    $bitmask .= "1";
+	}
+    }
+    print DISTR "$bitmask\n";
+
+    close(DISTR);
+    print "Closed $file\n";
+}
+
+
+# generate random parameters
+sub random_parameters {
+    my($self) = @_;
+
+    my($f);
+
+    srand();
+    for ($f = 0; $f < $self->{NR_FEATURES}; $f++) {
+	$self->{PARAMETERS}[$f] = rand() + 1;
+    }
+    if ($self->{SCALER} eq "gis") {
+	$self->{CORRECTION_PARAMETER} = rand();
+    }
+    $self->{PARAMETERS_CHANGED} = 1;
+}
+
+
+# sets parameters to $val
+sub set_parameters_to {
+    my($self, $val) = @_;
+
+    my($f);
+
+    for ($f = 0; $f < $self->{NR_FEATURES}; $f++) {
+	$self->{PARAMETERS}[$f] = $val;
+    }
+    if ($self->{SCALER} eq "gis") {
+	$self->{CORRECTION_PARAMETER} = $val;
+    }
+    $self->{PARAMETERS_CHANGED} = 1;
+}
+
+
+# initialise if !$self->{PARAMETERS_INITIALISED}; subsequent calls 
+# of scale (by fi) should not re-initialise parameters
+sub init_parameters {
+    my($self) = @_;
+
+    if (!$self->{PARAMETERS_INITIALISED}) {
+	if ($self->{SCALER} eq "gis") {
+	    $self->set_parameters_to(1);
+	}
+	else {
+	    $self->random_parameters();
+#	    $self->set_parameters_to(1);
+	}
+	$self->{PARAMETERS_INITIALISED} = 1;
     }
 }
 
 
 # make sure \tilde{p} << q_0
-sub check_initial_distr {
-    my $i;
-
-    for ($i = 0; $i < $nr_events; $i++) {
-	if ((p($i) == 0) && (p_ref($i) != 0)) {
-	    die "Initial distribution not ok!\n";
-	}
-    }
-}
-
-
 # constant feature functions are forbidden: that is why
 # we check whether for all features \sum_x f(x) > 0
-# and \sum_x f(x) != $nr_events
-sub check_features {
-    my($x,$f);
-    my $sum = 0;
+# and \sum_x f(x) != $corpus_size
+sub check {
+    my($self) = @_;
 
-    for ($f = 0; $f < $nr_features; $f++) {
+    my ($x,
+	$f,
+	$sum);
+
+    $sum = 0;
+    for ($x = 0; $x < $self->{NR_CLASSES}; $x++) {
+	if ($self->{CLASS_PROBS}[$x] == 0) {
+	    print "Initial distribution not ok; event $x\n";
+	}
+	$sum += $self->{CLASS_PROBS}[$x];
+    }
+    if ($debug && ($sum != 1)) {
+	print "Sum of the probabilities: $sum\n";
+    }
+
+    for ($f = 0; $f < $self->{NR_FEATURES}; $f++) {
 	$sum = 0;
-	for ($x = 0; $x < $nr_events; $x++) {
-	    $sum += $events[$x]->bit_test($f);
+	for ($x = 0; $x < $self->{NR_CLASSES}; $x++) {
+	    $sum += $self->{CLASSES}[$x]->bit_test($f);
 	}
-	if (!$sum || ($sum == $nr_events)) {
-	    die "Feature ",$f+1, " is constant, remove it\n";
-	}
-    }
-}
-
-
-# check whether for all features f, \sum_x f(x) > 0
-sub check_candidates {
-    my($x,$f);
-    my $sum = 0;
-
-    for ($f = 0; $f < $nr_candidates; $f++) {
-	$sum = 0;
-	for ($x = 0; $x < $nr_events; $x++) {
-	    $sum += $candidates[$x]->bit_test($f);
-	}
-	if (!$sum || ($sum == $nr_events)) {
-	    die "Candidate feature ",$f+1, " is constant, remove it\n";
+	if (!$sum || ($sum == $self->{NR_CLASSES})) {
+	    print "Feature ", $f + 1, " is constant ($sum), and will be ignored\n";
+	    $self->{FEATURE_IGNORE}{$f} = 1;
 	}
     }
-}
-
-
-# writes the the current parameters to a file
-sub write_parameters {
-    my($file) = shift;
-
-    open(DISTR,">$file") ||
-	die "Could not open $file\n";
-    print "Opened $file\n";
-    for (@pars) {
-	print DISTR "$_\n";
-    }
-    close(DISTR);
-    print "Closed $file\n";
 }
 
 
 # writes events to a file 
 # usefull in case new features have been added
-sub write_events {
-    my($file) = shift;
-    my($x,$f);
+# syntax: same as input events file
+sub write {
+    my($self, $file) = @_;
 
+    my($x, $f);
+
+    # prologue
     open(EVENTS,">$file") ||
-	die "Could not open $file\n";
+	$self->die("Could not open $file\n");
     print "Opened $file\n";
-    for ($x = 0; $x < $nr_events; $x++) {
-	print EVENTS $events[$x]->to_Bin();
-	print EVENTS " $p_ref[$x]\n";
+
+    # write a line with the feature names
+    print EVENTS join("\t", $self->{FEATURE_NAMES}),"\n";
+    # write the events themselves
+    for ($x = 0; $x < $self->{NR_CLASSES}; $x++) {
+	print EVENTS $self->{FREQ}[$x],"\t";
+	print EVENTS $self->{CLASSES}[$x]->to_Bin(), "\n";
     }
+
+    # close the file and tell you did that
     close EVENTS;
+    print "Wrote $self->{NR_EVENTS} events, $self->{NR_CLASSES} classes, " . 
+	"and $self->{NR_FEATURES} features\n";
     print "Closed $file\n";
 }
 
 
-# prints the parameters of the current distr to the screen
-sub print_distr {
-    my $i = 0;
+# makes enum strings from Bit::Vector internal (C) format if necessary
+sub perldata {
+    my($self) = @_;
 
-    for (@pars) {
-	print "$i: $_\n";
-	$i++
-    }
+    @{$self->{CLASSES}} = map {$_->to_Enum()} @{$self->{CLASSES}};
 }
 
 
-# writes the added features to a file
-# in the feature it might even more (sic) info...
-sub write_info {
-    my($file) = @_;
+# makes Bit::Vector internal format from bitstrings if necessary
+sub cdata {
+    my($self) = @_;
 
-    my $f;
+    @{$self->{CLASSES}} = map 
+    {$VECTOR_PACKAGE->new_Enum($self->{NR_FEATURES}, $_)} 
+    @{$self->{CLASSES}};
+}
 
-    open(INFO,">$file") ||
-	die "Could not open $file\n";
+
+# reads a dump, and evaluates it into an object
+sub undump {
+    my($class, $file) = @_;
+
+    my($x,
+       $VAR1);
+
+    # open, slurp, and close file
+    open(UNDUMP, "$file") ||
+	croak "Could not open $file\n";
     print "Opened $file\n";
-    if ($nr_candidates) {
-	print INFO "Added ";
-	for ($f = 0; $f < $nr_candidates; $f++) {
-	    if ($is_added{$f}) {
-		print INFO "$f\t";
-	    }
-	}
+    undef $/;
+    $x = <UNDUMP>;
+    $/ = "\n";
+    close(UNDUMP);
+
+    # and undump
+    eval $x;
+    if (!$SPARSE) {
+	$VAR1->cdata();
     }
-    print INFO "\n";
-    print INFO "p(events) ", p_events(), "\n";
-    print INFO "Z $Z\n", ;
-    close(INFO);
+    print "Undumped $VAR1->{NR_EVENTS} events, $VAR1->{NR_CLASSES} classes, " . 
+	"and $VAR1->{NR_FEATURES} features\n";
+    print "Closed $file\n";
+    return($VAR1);
+}
+
+
+# makes dump of the event space using Data::Dumper
+sub dump {
+    my($self, $file) = @_;
+
+    my(@bitvecs,
+       $dump,
+       %features,
+       $f);
+
+    if (!$file) {
+	$file = POSIX::tmpnam();
+    }
+    open(DUMP, ">$file") ||
+	croak "Could not open $file\n";
+    print "Opened $file\n";
+
+    # build something that we can sort
+    # ONLY FOR CORPUS!
+    if (!$self->{THIS_IS_A_SAMPLE}) {
+    for ($f = 0; $f < $self->{NR_FEATURES}; $f++) {
+        $features{$self->{FEATURE_NAMES}[$self->{NR_FEATURES} - $f - 1]} = 
+	    $self->{PARAMETERS}[$f];
+    }
+    if ($self->{NEED_CORRECTION_FEATURE} && ($self->{SCALER} eq "gis")) {
+        $features{"correction$self->{M}"} = 
+	    $self->{CORRECTION_PARAMETER};
+    }
+    # and print it into $self
+    $self->{FEATURE_SORTED} = join(' > ',
+				   sort {
+				       if ($features{$b} == $features{$a}) {
+					   return($b cmp $a)} 
+				       else {
+					   return ($features{$b} <=> $features{$a})
+					   }
+				   }
+				   keys(%features));
+}
+
+    # save classes
+    if (!$SPARSE) {
+	@bitvecs = @{$self->{CLASSES}};
+    }
+    $dump = Data::Dumper->new([$self]);
+    # perldata makes bitstrings
+    if (!$SPARSE) {
+	$dump->Freezer('perldata');
+    }
+    print DUMP $dump->Dump();
+    # restore classes
+    if (!$SPARSE) {
+	@{$self->{CLASSES}} = @bitvecs;
+    }
+
+    print "Dumped $self->{NR_EVENTS} events, $self->{NR_CLASSES} classes, " . 
+	"and $self->{NR_FEATURES} features\n";
+
+    close(DUMP);
     print "Closed $file\n";
 }
 
 
-##	Computation routines
+# $msg is logged, the time is logged, a dump is created, and the
+# program dies with $msg
+sub die {
+    my($self, $msg) = @_;
 
-# computes \sum_{x\in\Omega} p(x)g(x)
-# functions $p and $g receive event number!
-sub E {
-    my($p) = shift;
-    my($g) = shift;
+    $self->log($msg);
+    $self->log(time());
+    $self->dump();
+    croak $msg;
+}
 
-    my $sum = 0;
-    my $i;
 
-    for ($i = 0; $i < $nr_events; $i++) {
-	$sum += &$g($i) * &$p($i);
+# prints a msg to STDOUT, and appends it to $self->{LOG}
+# so an emergency dump will contain some history information
+sub log {
+    my($self, $x) = @_;
+
+    $self->{LOG} .= $x;
+    print $x;
+}
+
+
+# computes f_# for alle events; results in @sample_nr_feats_on
+# computes %$sample_m_feats_on; a HOL from m 
+sub active_features {
+    my($self) = @_;
+
+    my($i,
+       $j);
+
+    if ($self->{CLASSES_CHANGED}) {
+	# M is needed for both gis and iis
+	# NEED_CORRECTION_FEATURE is for gis only
+	# NR_FEATURES_ACTIVE for iis only
+	$self->{M} = 0;
+	$self->{NEED_CORRECTION_FEATURE} = 0;
+	undef $self->{NR_FEATURES_ACTIVE};
+	for ($i = 0; $i < $self->{NR_CLASSES}; $i++) {
+	    $self->{NR_FEATURES_ACTIVE}[$i] = 0;
+	    for ($j = 0; $j < $self->{NR_FEATURES}; $j++) {
+		$self->{NR_FEATURES_ACTIVE}[$i] += 
+		    $self->{CLASSES}[$i]->bit_test($j);
+	    }
+	    if (!$self->{M}) { 
+		# is undefined!
+		$self->{M} = $self->{NR_FEATURES_ACTIVE}[$i];
+	    }
+	    elsif ($self->{NR_FEATURES_ACTIVE}[$i] > $self->{M}) {
+		# higher nr_features_active found
+		$self->{M} = $self->{NR_FEATURES_ACTIVE}[$i];
+		$self->{NEED_CORRECTION_FEATURE} = 1;
+	    }
+	    if ($debug) {
+		print "f_#($i) = $self->{NR_FEATURES_ACTIVE}[$i]\n";
+	    }
+	}
+	if ($debug) {
+	    print "M = $self->{M}\n";
+	}
+	# set up a hash from m to classes HOL; and the correction_feature
+	# M_FEATURES_ACTIVE IS FOR iis
+	# CORRECTION_FEATURE FOR gis
+	undef $self->{M_FEATURES_ACTIVE};
+	for ($i = 0; $i < $self->{NR_CLASSES}; $i++) {
+	    push @{$self->{M_FEATURES_ACTIVE}{$self->{NR_FEATURES_ACTIVE}[$i]}}, 
+	         $i;
+	    $self->{CORRECTION_FEATURE}[$i] = $self->{M} - 
+		$self->{NR_FEATURES_ACTIVE}[$i];
+	    # changed $self->{M} into $self->{NR_FEATURES}
+#	    $self->{CORRECTION_FEATURE}[$i] = $self->{NR_FEATURES} - 
+#		$self->{NR_FEATURES_ACTIVE}[$i];
+	}
+	if ($debug) {
+	    print "M = $self->{M}\n";
+	}
+	# observed feature expectations
+	if (!$self->{THIS_IS_A_SAMPLE}) {
+	    for ($j = 0; $j < $self->{NR_FEATURES}; $j++) {
+		# observed feature expectations; gis and iis
+		$self->E_reference($j);
+	    }
+	    $self->E_reference_correction();
+	}
+	undef $self->{CLASSES_CHANGED};
     }
-    return($sum);
 }
 
 
-# returns p^{(n)}(x)
-sub p {
-    my($x) = shift;
-    
-    return $p[$x];
+# compute the class probabilities according to the parameters
+sub prepare_model {
+    my($self) = @_;
+
+    my ($x, 
+	$f, 
+	$sum);
+
+    $self->active_features();
+    if ($self->{PARAMETERS_CHANGED}) {
+	$self->{Z} = 0;
+	for ($x = 0; $x < $self->{NR_CLASSES}; $x++) {    
+	    $sum = 0;
+	    for ($f = 0; $f < $self->{NR_FEATURES}; $f++) {
+		if (!$self->{FEATURE_IGNORE}{$f} && 
+		    $self->{CLASSES}[$x]->bit_test($f)) {
+		    $sum += $self->{PARAMETERS}[$f];
+		}
+	    }
+	    if ($self->{NEED_CORRECTION_FEATURE} && ($self->{SCALER} eq "gis")) {
+		$sum += $self->{CORRECTION_FEATURE}[$x] * 
+		    $self->{CORRECTION_PARAMETER};
+	    }
+	    $self->{CLASS_WEIGHTS}[$x] = exp($sum);
+	    $self->{Z} += $self->{CLASS_WEIGHTS}[$x];
+	}
+	# normalise
+	for ($x = 0; $x < $self->{NR_CLASSES}; $x++) {    
+	    $self->{CLASS_PROBS}[$x] = $self->{CLASS_WEIGHTS}[$x] / $self->{Z};
+	}
+	# expectations
+	for ($f = 0; $f < $self->{NR_FEATURES}; $f++) {
+	    $self->E_loglinear($f);
+	}
+	$self->E_loglinear_correction();
+	# A_{mj}
+	if ($self->{SCALER} eq "iis") {
+	    $self->A();
+	}
+	if (!$self->{THIS_IS_A_SAMPLE}) {
+	    $self->entropies();
+	}
+	$self->check();
+	undef $self->{PARAMETERS_CHANGED};
+    }
 }
 
 
-# (re)computes the current distribution p^{(n)}
-sub curr_distr {
-    my($corr) = @_;
+sub E_loglinear {
+    my($self, $i) = @_;
 
-    my ($x, $f);
-    my $sum;
+    my($x,
+       $sum);
 
-    $Z = 0;
-    for ($x = 0; $x < $nr_events; $x++) {    
+    $sum = 0;
+    for ($x = 0; $x < $self->{NR_CLASSES}; $x++) {    
+	if ($self->{CLASSES}[$x]->bit_test($i)) {
+	    $sum += $self->{CLASS_PROBS}[$x];
+	}
+    }
+    $self->{E_LOGLIN}[$i] = $sum;
+}
+
+
+sub E_loglinear_correction {
+    my($self) = @_;
+
+    my($x,
+       $sum);
+
+    if ($self->{NEED_CORRECTION_FEATURE} && ($self->{SCALER} eq "gis")) {
 	$sum = 0;
-	for ($f = 0; $f < $nr_features; $f++) {
-	    $sum += $events[$x]->bit_test($f) * $pars[$f];
+	for ($x = 0; $x < $self->{NR_CLASSES}; $x++) {    
+	    $sum += $self->{CORRECTION_FEATURE}[$x] * $self->{CLASS_PROBS}[$x];
 	}
-	if ($corr) {
-	    $sum += ($M - $nr_feats_on[$x]) * $correction_parameter;
-	}
-	$p[$x] = exp($sum);
-	$Z += $p[$x];
-    }
-    # normalise
-    for ($x = 0; $x < $nr_events; $x++) {    
-	$p[$x] /= $Z;
+	$self->{E_LOGLIN}[$self->{NR_FEATURES}] = $sum;
     }
 }
 
 
-# gives reference probability for an event
-sub p_ref {
-    my($event) = shift;
+sub E_reference {
+    my($self, $i) = @_;
 
-    return($p_ref[$event]);
+    my($x,
+       $sum);
+
+    $sum = 0;
+    for ($x = 0; $x < $self->{NR_CLASSES}; $x++) {
+	if ($self->{CLASSES}[$x]->bit_test($i)) {
+	    $sum += $self->{FREQ}[$x];
+	}
+    }
+    $self->{E_REF}[$i] = $sum / $self->{NR_EVENTS};
 }
 
 
-# compute a_{m,j}^{(n)}
-sub a_mj {
-    my($m) = shift;
-    my($j) = shift;
+sub E_reference_correction {
+    my($self) = @_;
 
-    my $func;
+    my($x,
+       $sum);
 
-    if ($m == 0) {
-	return(-$E_ref[$j]);
+    if (($self->{SCALER} eq "gis") && ($self->{NEED_CORRECTION_FEATURE})) {
+	$sum = 0;
+	for ($x = 0; $x < $self->{NR_CLASSES}; $x++) {
+	    $sum += $self->{CORRECTION_FEATURE}[$x] * 
+		$self->{FREQ}[$x];
+	}
+	$self->{E_REF}[$self->{NR_FEATURES}] = $sum / $self->{NR_EVENTS};
     }
-    else {
-	$func = sub {
-	    my($event) = shift;
-	    
-	    # f_j * \delta(m,f_#)
-	    if ($m == $nr_feats_on[$event]) {
-		return($events[$event]->bit_test($j));
-	    }
-	    else {
-		return(0);
-	    }
-	};
-	return(E(\&p,$func));
+}
+
+
+# compute several entropies
+sub entropies {
+    my($self) = @_;
+
+    my ($i, 
+	$p,
+	$log_p,
+	$p_ref,
+	$log_p_ref);
+
+    $self->{H_p} = 0;
+    $self->{H_cross} = 0;
+    $self->{H_p_ref} = 0;
+    $self->{KL} = 0;
+    for ($i = 0; $i < $self->{NR_CLASSES}; $i++) {
+	$p = $self->{CLASS_PROBS}[$i];
+	# we don't know whether $p > 0
+	$log_p = ($p > 0) ? log($p) : 0;
+	$p_ref = $self->{FREQ}[$i] / $self->{NR_EVENTS};
+	# we know that $p_ref > 0
+	$log_p_ref = log($p_ref);
+	$self->{H_p} -= $p * $log_p;
+	$self->{H_cross} -= $p_ref * $log_p;
+	$self->{KL} += $p_ref * ($log_p_ref - $log_p);
+	$self->{H_p_ref} -= $p_ref * $log_p_ref;
+	if ($p == 0) {
+	    $self->log("entropies: skipping event $i (p^n($i) = 0)\n");
+	}
     }
+    $self->{L} = -$self->{H_cross};
+}
+
+
+# for GIS, if f_# is not a constant function
+sub correction_feature {
+    my($self, $bitvec) = @_;
+
+    my($i,
+       $sum);
+
+    $sum = 0;
+    for ($i = 0; $i < $self->{NR_FEATURES}; $i++) {
+	$sum += $bitvec->bit_test($i);
+    }
+    return($self->{M} - $sum);
+}
+
+
+# unnormalised density
+sub weight {
+    my($self, $bitvec) = @_;
+
+    my ($f, 
+	$sum);
+
+    $sum = 0;
+    for ($f = 0; $f < $self->{NR_FEATURES}; $f++) {
+	if (!$self->{FEATURE_IGNORE}{$f} &&
+	    $bitvec->bit_test($f)) {
+	    $sum += $self->{PARAMETERS}[$f];
+	}
+    }
+    if ($self->{NEED_CORRECTION_FEATURE}) {
+	$sum += $self->correction_feature($bitvec) *
+	    $self->{CORRECTION_PARAMETER};
+    }
+    return(exp($sum));
+}
+
+
+# computes the probability of a bitvector
+sub prob {
+    my($self, $bitvec) = @_;
+
+    return($self->weight($bitvec) / $self->{Z});
 }
 
 
 # computes the `a' coefficients of 
 # \sum_{m=0}^{M} a_{m,j}^{(n)} e^{\alpha^{(n)}_j m}
 # according to the current distribution
-sub a {
-    my($j, $m);
+sub A {
+    my($self) = @_;
 
-    for  ($j = 0; $j < $nr_features; $j++) {
-	for ($m = 0; $m <= $M; $m++) {
-	    $a[$m][$j] = a_mj($m, $j);
-	    if ($debug) {
-		print "a[$m][$j] = $a[$m][$j]\n";
+    my($j, 
+       $m,
+       $class);
+
+    for  ($j = 0; $j < $self->{NR_FEATURES}; $j++) {
+	for ($m = 0; $m <= $self->{M}; $m++) {
+	    if ($m == 0) {
+		$self->{A}[0][$j] = -$self->{E_REF}[$j];
+	    }
+	    else {
+		$self->{A}[$m][$j] = 0;
+		for $class (@{$self->{M_FEATURES_ACTIVE}{$m}}) {
+		    if ($self->{CLASSES}[$class]->bit_test($j)) {
+			$self->{A}[$m][$j] += $self->{CLASS_PROBS}[$class];
+		    }
+		}
+		if ($debug) {
+		    print "a[$m][$j] = $self->{A}[$m][$j]\n";
+		}
 	    }
 	}
     }
 }
 
 
-# computes f_# for alle events
-# results in $nr_feats_on
-sub compute_nr_feats_on {
-    my($i, $j);
+# enumerates complete Omega; do not use if $nr_features is large!
+sub enum {
+    my($self) = @_;
 
-    for ($i = 0; $i < $nr_events; $i++) {
-	$nr_feats_on[$i] = 0;
-	for ($j = 0; $j < $nr_features; $j++) {
-	    $nr_feats_on[$i] += $events[$i]->bit_test($j);
-	}
-	if ($debug) {
-	    print "f_#($i) = $nr_feats_on[$i]\n";
-	}
+    my($f,
+       $vec);
+
+    $vec = $VECTOR_PACKAGE->new($self->{NR_FEATURES});
+    for ($f = 0; $f < 2 ** $self->{NR_FEATURES}; $f++) {
+	push @{$self->{CLASSES}}, $vec;
+	push @{$self->{FREQ}}, 1;
+	$vec++;
     }
+    $self->{NR_CLASSES} = 2 ** $self->{NR_FEATURES};
+    $self->{NR_EVENTS} = $f;
+    $self->{PARAMETERS_CHANGED} = 1;
+    $self->{CLASSES_CHANGED} = 1;
 }
 
 
-# the maximum number of feature that some event has on: M
-sub M {
-    my $i;
+#
+# Monte Carlo sampling with the Metropolis update
+#
 
-    $M = 0;
-    for ($i = 0;$i < $nr_events; $i++) {
-	if ($nr_feats_on[$i] > $M) {
-	    $M = $nr_feats_on[$i];
-	}
-    }
-    if ($debug) {
-	print "M = $M\n";
-    }
+# returns heads up with probability $load 
+sub loaded_die {
+    my($load) = @_;
+
+    (rand() <= $load) ? 1 : 0;
 }
 
 
-# separate procedure; called if one candidate is added
-sub E_ref_i {
-    my($i) = @_;
-    my $func;
+# samples from the probability distribution of $other to create $self
+# we use the so-called Metropolis update R = h(new)/h(old)
+# Metropolis algorithm \cite{neal:probabilistic}
+sub mc {
+    my($self, $other, $type) = @_;
 
-    $func = sub {
-	my ($event) = shift;
+    my($R,
+       $weight,
+       $state,
+       $old_weight,
+       $k,
+       %events
+       );
+
+    srand();
+    # take some class from the sample space as initial state
+    $state = $VECTOR_PACKAGE->new($self->{NR_FEATURES});
+    # make sure there are no constant features!
+    $state->Fill();
+    $events{$state->to_Bin()}++;
+    $state->Empty();
+    $weight = 1;
+    # iterate 
+    $k = 0;
+    do {
+	$old_weight = $weight;
+	if ($state->bit_flip($k)) {
+	    $weight += $self->{PARAMETERS}[$k];
+	}
+	else {
+	    $weight -= $self->{PARAMETERS}[$k];
+	}
+	$R = exp($weight - $old_weight);
+	if (!loaded_die(1 < $R ? 1 : $R)) { # stay at the old state
+	    $state->bit_flip($k);
+	    $weight = $old_weight;
+	}
+	$events{$state->to_Bin()}++;
+	# next component
+	$k = ($k + 1) % $self->{NR_FEATURES};
+    } until (scalar(keys(%events)) == $SAMPLE_size);
+    for (keys(%events)) {
+	push @{$self->{CLASSES}}, $VECTOR_PACKAGE->new_Bin($self->{NR_FEATURES}, $_);
+    }
+    $self->{NR_CLASSES} = scalar(keys(%events)) - 1;
 	
-	return($events[$event]->bit_test($i));
-    };
-    $E_ref[$i] = E(\&p_ref,$func);
+    $self->{CLASSES_CHANGED} = 1;
+    $self->{PARAMETERS_CHANGED} = 1;
 }
 
 
-# fills in $E_ref of the features
-sub E_ref {
-    my($i);
-    my $func;
-
-    for $i (0..$nr_features-1) {
-	E_ref_i($i);
-    }
-}
-
-
+#
+# IIS
+#
 sub a_func {
-    my($x) = shift;
-    my($j) = shift;
-    my($m, $sum);
+    my($self, $j, $x, $e_x) = @_;
 
-    $sum = 0;
-    for ($m = 0; $m <= $M; $m++) {
-	$sum += $a[$m][$j] * exp($x * $m);
+    my($m,
+       $sum_func,
+       $sum_deriv,
+       $a_x_m);
+
+    $sum_func = $self->{"A"}[0][$j];
+    $sum_deriv = 0;
+    for ($m = 1; $m <= $self->{M}; $m++) {
+	if ($self->{"A"}[$m][$j] != 0) {
+	    if ($e_x) {
+		$a_x_m = $self->{"A"}[$m][$j] * ($x ** $m);
+	    }
+	    else {
+		$a_x_m = $self->{"A"}[$m][$j] * exp($x * $m);
+	    }
+	    $sum_func += $a_x_m;
+	    $sum_deriv += $m * $a_x_m;
+	}
     }
-    return($sum);
-}
-
-
-sub a_deriv {
-    my($x) = shift;
-    my($j) = shift;
-    my($m, $sum);
-
-    $sum = 0;
-    for ($m = 1; $m <= $M; $m++) {
-	$sum += $a[$m][$j] * $m * exp($x * $m);
-    }
-    return($sum);
+    return($sum_func, $sum_deriv);
 }
 
 
 # solves \alpha from 
 # \sum_{m=0}^{M} a_{m,j}^{(n)} e^{\alpha^{(n)}_j m}=0
 sub iis_estimate_with_newton {
-    my($i) = shift;
-    my($x, $old_x);
-    my($deriv_res);
-    my $diff;
-    my $k = 0;
+    my($self, $i, $e_x) = @_;
 
-    # initialise x such that a_deriv(x) != 0
-    $x = 10;
+    my($x, 
+       $old_x,
+       $deriv_res,
+       $func_res,
+       $k);
+
+    $x = 1;
+    $k = 0;
 
     # do newton's method
     do {
 	# save old x
 	$old_x = $x;
 	# compute new x
-	$deriv_res = a_deriv($x,$i);
-	if ($deriv_res == 0) {
-	    print STDERR "Derivative of $i is zero\n";
+	($func_res, $deriv_res) = $self->a_func($i, $x, $e_x);
+	if (($deriv_res eq 'NaN') || ($deriv_res == 0) ||
+	    ($deriv_res eq 'Infinity')) {
+	    print "a_deriv($i, $x) = $deriv_res\n";
+	}
+	if (($func_res eq 'NaN') || ($func_res eq 'Infinity') ||
+	    ($func_res == 0)) {
+	    print "a_func($i, $x) = $func_res\n";
+	}
+	$x -= ($func_res / $deriv_res);
+	if ($x eq 'NaN') {
+	    print "$func_res / $deriv_res = NaN\n";
+	    print "feature $i will be ignored in future iterations\n";
+	    $self->{FEATURE_IGNORE}{$i} = 1;
 	    return(0);
 	}
-	$x = $x - a_func($x,$i) / $deriv_res;
-	if ($debug) {
-	    printf("x = %e\n",$x);
-	}
-	$diff = abs($x - $old_x);
-	$k++;
-    } until (($diff <= $NEWTON_min) ||
-	     ($k > $NEWTON_max_it));
+    } until ((abs($x - $old_x) <= $NEWTON_min) ||
+	     ($k++ > $NEWTON_max_it));
     if ($debug) {
-	print "Estimated new alpha_$i with Newton's method\n";
+	print "Estimated gamma_$i with Newton's method: $x\n";
     }
-    return($x);
+    return($e_x ? log($x) : $x);
 }
 
 
-# determines Kullback Leibler divergence between reference distribution
-# and current distribution
-# takes two function arguments
-sub KL {
-    my($p1,$p2) = @_;
+# the iterative scaling algorithms
+sub scale {
+    my($self, $sampling, $scaler) = @_;
 
-    my ($i, $sum);
+    my($k,
+       $i,
+       $kl,
+       $old_kl,
+       $diff,
+       $sample,
+       $old_correction_parameter,
+       @old_parameters);
 
-    $sum = 0;
-    for ($i = 0; $i < $nr_events; $i++) {
-	$sum += &$p1($i) * log(&$p1($i) / &$p2($i));
+    if ($sampling) {
+	$self->{SAMPLING} = $sampling;
     }
-    return($sum);
-}
-
-
-# returns entropy of p
-sub H {
-    my ($i, $sum);
-
-    $sum = 0;
-    for ($i = 0; $i < $nr_events; $i++) {
-	$sum += p($i) * log(p($i));
+    if ($scaler) {
+	$self->{SCALER} = $scaler;
     }
-    return(-$sum);
-}
-
-
-# cross entropy
-sub cross_H {
-    my ($i, $sum);
-
-    $sum = 0;
-    for ($i = 0; $i < $nr_events; $i++) {
-	$sum += p_ref($i) * log(p($i));
+    $self->init_parameters();
+    $self->prepare_model();
+    if ($self->{SAMPLING} eq "enum") {
+	$sample = $self->sample();
     }
-    return(-$sum);
-}
-
-
-# likelihood measure
-sub L {
-    return(-cross_H());
-}
-
-
-# sums the probabilities over all events (should be one)
-sub check_p {
-    my ($i, $sum);
-
-    for ($i = 0; $i < $nr_events; $i++) {
-	$sum += p($i)
-    }
-    print "Sum of final distr: $sum\n";
-}
-
-
-sub p_events {
-    my ($i, $prod);
-
-    $prod =1;
-    for ($i = 0; $i < $nr_events; $i++) {
-	$prod *= p($i);
-    }
-    return($prod);
-}
-
-
-#
-# Field induction, given a set of candidates and the current 
-# distribution p, the best candidate is found and added to the model
-#
-
-# computes the gain G_p(g) of a candidate feature
-sub G {
-    my($g, $is) = @_;
-
-    my $func;
-    my $i;
-    my $new_kl;
-    my $max;
-    my $below;
-    my $above;
-    my $E_p_ref_g;
-    my $E_p_g;
-
-    $func = sub {
-	my($event) = shift;
-
-	return($candidates[$event]->bit_test($g));
-    };
-    $E_p_ref_g = E(\&p_ref,$func);
-    $E_p_g = E(\&p,$func);
-    $above = $E_p_ref_g * (1 - $E_p_g);
-    $below = $E_p_g * (1 - $E_p_ref_g);
-    if ((($above > 0) && ($below > 0)) ||
-	(($above < 0) && ($below < 0))) {
-	$max = log(abs($above)) - log(abs($below));
-    }
-    else {
-	die "Cannot take log of negative or zero value: $above / $below\n";
-    }
-
-    # temporarily add feature to field
-    $nr_features++;
-    for ($i = 0; $i < $nr_events; $i++) {
-	$events[$i]->Interval_Substitute($candidates[$i],
-					       $events[$i]->Size(),
-					       0,
-					       $g,
-					       1);
-    }
-    $pars[$nr_features - 1] = $max;
-
-    # renormalise and compute KL
-    curr_distr($is == \&GIS);
-    $new_kl = KL(\&p_ref,\&p);
-
-    # restore old field and renormalise
-    for ($i = 0; $i < $nr_events; $i++) {
-	$events[$i]->Resize($events[$i]->Size() - 1);
-    }
-    undef $pars[$nr_features - 1];
-    $nr_features--;
-    curr_distr($is == \&GIS);
-
-    # return gain
-    return(KL(\&p_ref,\&p) - $new_kl, $max);
-}
-
-
-#
-# Improved Iterative Scaling Algorithm
-# 
-sub iis {
-    my $k = 0;
-    my $i;
-    my $kl = 1e99;
-    my $old_kl;
-    my $diff;
-    
-    print "IIS:\n";
-    print "it.\tD(p_ref||p)\tL(p)\t\tp(events)\n";
-    printf "0\t%e\t%e\t%e\n", KL(\&p_ref,\&p), L(), p_events();
+    $self->log("($self->{SCALER}, $self->{SAMPLING}): H(p_ref)=$self->{H_p_ref}\nit.\tD(p_ref||p)\t\tH(p)\t\t\tL(p_ref,p)\t\ttime\n0\t$self->{KL}\t$self->{H_p}\t$self->{L}\t" . time() . "\n");
+    $k = 0;
+    $kl = 1e99;
     do {
-	a();
-	for ($i = 0; $i < $nr_features; $i++) {
-	    $pars[$i] += iis_estimate_with_newton($i);
+	# store parameters for reverting if converging stops
+	@old_parameters = @{$self->{PARAMETERS}};
+	$old_correction_parameter = $self->{CORRECTION_PARAMETER};
+	if ($self->{SAMPLING} ne "enum") { 
+	    if ($sample) {
+		$sample->DESTROY();
+	    }
+	    $sample = $self->sample();
 	}
-	$old_kl = $kl;
-	curr_distr(0);
-	$kl = KL(\&p_ref,\&p);
+	$sample->prepare_model();
+	for ($i = 0; $i < $self->{NR_FEATURES}; $i++) {
+	    if (!$self->{FEATURE_IGNORE}{$i} && !$sample->{FEATURE_IGNORE}{$i}) {
+		if ($self->{SCALER} eq "gis") {
+		    $self->{PARAMETERS}[$i] *= ($self->{E_REF}[$i] / 
+			$sample->{E_LOGLIN}[$i]) ** (1 / $self->{M});
+		}
+		else {
+		    $self->{PARAMETERS}[$i] += 
+			$sample->iis_estimate_with_newton($i);
+		}
+	    }
+	}
+	if (($self->{SCALER} eq "gis") && ($self->{NEED_CORRECTION_FEATURE})) {
+	    $self->{CORRECTION_PARAMETER} *=
+		($self->{E_REF}[$self->{NR_FEATURES}] / 
+		 $sample->{E_LOGLIN}[$self->{NR_FEATURES}]) ** 
+		     (1 / $self->{M});
+	}
+	$self->{PARAMETERS_CHANGED} = 1;
+	$self->prepare_model();
+	$diff = $kl - $self->{KL};
+	$kl = $self->{KL};
+
 	$k++;
-	printf "%u\t%e\t%e\t%e\n", $k, $kl, L(), p_events();
+	$self->log("$k\t$self->{KL}\t$self->{H_p}\t$self->{L}\t" . time() . "\n");
 	if ($debug) {
-	    print_distr();
+	    $self->check();
 	}
-	$diff = $old_kl - $kl;
 	if ($diff < 0) {
-	    die "Something is very wrong; IIS is not converging!\n";
+	    $self->log("Scaling is not converging (anymore); will revert parameters!\n");
+	    # restore old parameters
+	    $self->{PARAMETERS} = \@old_parameters;
+	    $self->{CORRECTION_PARAMETER} = $old_correction_parameter;
+	    $self->{PARAMETERS_CHANGED} = 1;
+	    $self->prepare_model();
+	}
+	if ($cntrl_backslash_pressed) { 
+	    $self->dump();
+	    $cntrl_backslash_pressed = 0;
 	}
     } until ($diff <= $KL_min || 
-	     ($k > $KL_max_it));
-    if ($debug) {
-	curr_distr(0);
-	check_p();
-    }
-}
-
-
-sub correction_feature {
-    my($event) = @_;
-    
-    return($M - $nr_feats_on[$event]);
-}
-
-
-#
-# Generalised Iterative Scaling Algorithm
-# 
-sub gis {
-    my $k = 0;
-    my $i;
-    my $kl = 1e99;
-    my $old_kl;
-    my $diff;
-    my $func;
-    
-
-    print "GIS:\n";
-    print "it.\tD(p_ref||p)\tL(p)\t\tp(events)\n";
-    printf "0\t%e\t%e\t%e\n", KL(\&p_ref,\&p), L(), p_events();
-    for $i (0..$nr_features-1) {
-	$pars[$i] = 1;
-    }
-    $correction_parameter = 1;
-    curr_distr(1);
-    do {
-	# binary features
-	for $i (0..$nr_features-1) {
-	    $func = sub {
-		my ($event) = @_;
-
-		return($events[$event]->bit_test($i));
-	    };
-#	    print "\$E_ref[$i] : $E_ref[$i]\n";
-#	    print "\$pars[\$i]: $pars[$i]\n";
-	    $pars[$i] *= exp((log($E_ref[$i]) - log(E(\&p,$func))) / $M);
-	}
-
-	# correction feature parameter estimation
-	$correction_parameter *= 
-	    exp((log(E(\&p_ref,\&correction_feature)) - 
-		 log(E(\&p,\&correction_feature))) / $M);
-
-	$old_kl = $kl;
-	curr_distr(1);
-	$kl = KL(\&p_ref,\&p);
-	$k++;
-	printf "%u\t%e\t%e\t%e\n", $k, $kl, L(), p_events();
-	if ($debug) {
-	    print_distr();
-	}
-	$diff = $old_kl - $kl;
-	if ($diff < 0) {
-	    die "Something is very wrong; GIS is not converging!\n";
-	}
-    } until ($diff <= $KL_min || 
-	     ($k > $KL_max_it));
-    if ($debug) {
-	curr_distr(1);
-	check_p();
-    }
+	     ($k > $KL_max_it) ||
+	     ($diff < 0));
 }
 
 
 #
 # Field Induction Algorithm
 #
-# adds the best candidate!
-sub fia {
-    my($is) = @_;
 
-    my ($i, $gain, $par);
-    my $best_gain = 0;
-    my $best_par = 0;
-    my $best_i = 0;
+# add feature $g to $self
+sub add_feature {
+    my($self, $candidates, $g) = @_;
 
-    # find the best candidate
-    for ($i = 0; $i < $nr_candidates; $i++) {
-	# check if not already added
-	if (!$is_added{$i}) {
-	    ($gain,$par) = G($i, $is);
-	    printf "%u\t gain: %e\talpha: %e\n", $i, $gain, $par;
-	    if ($best_gain < $gain) {
-		$best_gain = $gain;
-		$best_i = $i;
-		$best_par = $par;
-	    }
-	}
+    my($i);
+
+    $self->{NR_FEATURES}++;
+    for ($i = 0; $i < $self->{NR_CLASSES}; $i++) {
+	$self->{CLASSES}[$i]->Interval_Substitute($candidates->{CANDIDATES}[$i],
+						  $self->{CLASSES}[$i]->Size(),
+						  0, $g, 1);
     }
-
-    # extend the events with the best candidate
-    print "Adding candidate $best_i\n";
-    $nr_features++;
-    for ($i = 0; $i < $nr_events; $i++) {
-	$events[$i]->Interval_Substitute($candidates[$i],
-					 $events[$i]->Size(),
-					 0,
-					 $best_i,
-					 1);
-    }
-    $pars[$nr_features - 1] = $best_par;
-    $is_added{$best_i} = 1;
-    M();
-    E_ref_i($nr_features-1);
-    &$is();
-}
-
-
-##---------------------------------------------------------------------------##
-##	Public routines
-##---------------------------------------------------------------------------##
-
-# read events, parameters, and candidates
-sub init {
-    my($e,$p,$c) = @_;
-    
-    if ($e) {
-	read_events($e);
+    if ($self->{SCALER} eq "gis") {
+	$self->{PARAMETERS}[$self->{NR_FEATURES} - 1] = 1;
     }
     else {
-	die "Event file is required\n";
+	$self->{PARAMETERS}[$self->{NR_FEATURES} - 1] = $candidates->{ALPHA}[$g];
     }
-    if ($p) {
-	read_parameters($p);
-	$correction_parameter = 1;
-    }
-    else {
-	random_parameters();
-    }
-    if ($c) {
-	read_candidates($c);
-    }
-
-    # some computations
-    compute_nr_feats_on();
-    M();
-    E_ref();
-    curr_distr(0);
-
-    # some checks
-    check_initial_distr();
-    check_features();
+    unshift @{$self->{FEATURE_NAMES}}, $candidates->{CANDIDATE_NAMES}[$g];
+    $self->{PARAMETERS_CHANGED} = 1;
+    $self->{CLASSES_CHANGED} = 1;
+    $self->prepare_model();
 }
 
 
-# create random event, parameter and candidate files
-sub random_init {
-    my($e,$p,$c) = @_;
+# remove feature $g
+sub remove_feature {
+    my($self, $g) = @_;
 
-    my($x,
-       $f,
-       %no_double_events,
-       $vec,
-       $freq);
+    my($i
+       );
 
-    # randomise
-    srand();
-
-    # open the files
-    if ($e) {
-	open(EVENTS,">$e") ||
-	    die "Could not open $e\n";
+    for ($i = 0; $i < $self->{NR_CLASSES}; $i++) {
+	# substitute offset $g length 1 by nothing
+	$self->{CLASSES}[$i]->Interval_Substitute($self->{CLASSES}[$i],
+						  $g, 1, 0, 0);
     }
-    if ($c) {
-	open(CANDS,">$c") ||
-	    die "Could not open $c\n";
+    splice(@{$self->{PARAMETERS}}, $g, 1);
+    splice(@{$self->{FEATURE_NAMES}}, $self->{NR_FEATURES} - 1 - $g, 1);
+    $self->{NR_FEATURES}--;
+    $self->{PARAMETERS_CHANGED} = 1;
+    $self->{CLASSES_CHANGED} = 1;
+    $self->prepare_model();
+}
+
+
+# checks for $event, if not there adds it, otherwise increases its {FREQ}
+sub add_event {
+    my($self, $event) = @_;
+
+    my($i,
+       $found);
+
+    $found = 0;
+    for ($i = 0; $i < $self->{NR_CLASSES}; $i++) {
+	$found = ($event->Compare($self->{CLASSES}[$i]) == 0);
+	if ($found) {
+	    $self->{FREQ}[$i]++;
+	    last;
+	}
     }
-    if ($p) {
-	open(DISTR,">$p")  ||
-	    die "Could not open $p\n";
+    if (!$found) {
+	$self->{CLASSES}[$self->{NR_CLASSES}] = $event->Clone();
+	$self->{FREQ}[$self->{NR_CLASSES}] = 1;
+	$self->{NR_CLASSES}++;
     }
+    $self->{NR_EVENTS}++;
+}
 
-    $nr_features = ceil(rand($rand_max_features));
-    print "Number of features: $nr_features\n";
 
-    # greater than 1 AND smaller than (2^$nr_features - 1)
-    $nr_events = 100;#1 + ceil(rand(1 << ($nr_features - 1)));
-    print "Number of events: $nr_events\n";
+# computes the gain for all $candidates
+sub gain {
+    my($self, $candidates) = @_;
 
-    $nr_candidates = ceil(rand($rand_max_candidates));
-    print "Number of candidates: $nr_candidates\n";
+    my($c,
+       $x,
+       $kl,
+       $below,
+       $above,
+       $sum_p_ref,
+       $sum_p);
 
-    # events
-    $x = 0;
-    while ($x < $nr_events) {
-	$freq = 1 + floor(rand(100));
-	$vec = Bit::Vector->new($nr_features);
-	for ($f = 0; $f < $nr_features; $f++) {
-	    if (rand() < 0.5) {
-		$vec->Bit_On($f);
+    $candidates->{MAX_GAIN} = 0;
+    $candidates->{BEST_CAND} = 0;
+    for ($c = 0; $c < $candidates->{NR_CANDIDATES}; $c++) {
+	if (!$candidates->{ADDED}{$c}) {
+	    $sum_p_ref = 0;
+	    $sum_p = 0;
+	    for ($x = 0; $x < $self->{NR_CLASSES}; $x++) {
+		if ($candidates->{CANDIDATES}[$x]->bit_test($c)) {
+		    $sum_p += $self->{CLASS_PROBS}[$x];
+		    $sum_p_ref += $self->{FREQ}[$x];
+		}
 	    }
-	}
-	if (!$no_double_events{$vec->to_Bin}) {
-	    $no_double_events{$vec->to_Bin()} = $x;
-	    $p_ref[$x] = $freq;
-	    $events[$x] = $vec->Clone();
-	    $x++;
-	}
-	else {
-	    $p_ref[$no_double_events{$vec->to_Bin()}] += $freq;
-	}
-    }
-    for ($x = 0; $x < $nr_events; $x++) {
-	print EVENTS $p_ref[$x]," ";
-	print EVENTS $events[$x]->to_Bin(), "\n";
-    }
-
-    # candidates
-    for ($x = 0; $x < $nr_events; $x++) {
-	$candidates[$x] = Bit::Vector->new($nr_candidates);
-	for ($f = 0; $f < $nr_candidates; $f++) {
-	    if (rand() < 0.5) {
-		$candidates[$x]->Bit_On($f);
+	    $sum_p_ref /= $self->{NR_EVENTS};
+	    $above = $sum_p_ref * (1 - $sum_p);
+	    $below = $sum_p * (1 - $sum_p_ref);
+	    if ((($above > 0) && ($below > 0)) || (($above < 0) && ($below < 0))) {
+		$candidates->{ALPHA}[$c] = log(abs($above)) - log(abs($below));
 	    }
+	    else {
+		$self->die("Cannot take log of negative/zero value: $above / $below\n");
+	    }
+	    
+	    # temporarily add feature to classes and compute $gain
+	    $kl = $self->{KL};
+	    $self->add_feature($candidates, $c);
+	    $candidates->{GAIN}[$c] = $kl - $self->{KL};
+	    $self->log("G($c, $candidates->{ALPHA}[$c]) = $candidates->{GAIN}[$c]\n");
+	    if (($candidates->{MAX_GAIN} <= $candidates->{GAIN}[$c])) {
+		$candidates->{MAX_GAIN} = $candidates->{GAIN}[$c];
+		$candidates->{BEST_CAND} = $c;
+	    }
+	    # remove the feature
+	    $self->remove_feature($self->{NR_FEATURES} - 1);
 	}
-	print CANDS $candidates[$x]->to_Bin,"\n";
-    }
-
-    # throw away double administration
-    undef %no_double_events;
-
-    # parameters
-    for ($f = 0; $f < $nr_features; $f++) {
-	$pars[$f] = 1; #rand();
-	print DISTR $pars[$f],"\n";
-    }
-    $correction_parameter = 1;
-    
-    # close the files
-    close(EVENTS);
-    close(DISTR);
-    close(CANDS);    
-
-    # some computations
-    if ($normalise) {
-	normalise_p_ref();
-    }
-    compute_nr_feats_on();
-    M();
-    E_ref();
-    curr_distr(0);
-
-    # some checks
-    check_initial_distr();
-    check_features();
-}
-
-
-# wrapper around fia()
-# dies if no candidates are given
-sub FI {
-    my($nr_to_add, $is) = @_;
-
-    my $i;
-
-    print "FI: $nr_to_add\n";
-    if ($nr_candidates == 0) {
-	die "Don't have candidates\n";
-    }
-    if (!$nr_to_add) {
-	$nr_to_add = 1;
-    }
-    if ($nr_to_add > $nr_candidates) {
-	$nr_to_add = $nr_candidates;
-    }
-    if (!$is) {
-	$is = \&IIS;
-    }
-    if ($nr_candidates > 0) {
-	# fia() assumes scaling is done for current features
-	curr_distr($is == \&GIS);
-	&$is();
-	for ($i = 0; $i < $nr_to_add; $i++) {
-	    fia($is);
-	}
-	# scale the last time;
-	# reference distribution of the last added feature
-	&$is();
     }
 }
 
 
-# wrapper around iis()
-sub IIS {
-   if ($nr_events > 0) {
-       iis();
-   }
-   else {
-       die "Don't have events\n";
-   }
-}
+# adds the $n best candidates
+sub fi {
+    my($self, $scaler, $candidates, $n, $sample) = @_;
 
+    my ($i,
+	$kl);
 
-# wrapper around gis()
-sub GIS {
-    my $i;
-
-    if ($nr_events > 0) {
-	gis();
+    $self->log("(fi, $scaler, $sample, $n)\n");
+    if ($scaler) {
+	$self->{SCALER} = $scaler;
     }
-    else {
-	die "Don't have events\n";
+    if ($sample) {
+	$self->{SAMPLING} = $sample;
     }
+
+    if ($self->{NR_CLASSES} != $candidates->{NR_CLASSES}) {
+	$self->die("Candidates have the wrong number of events\n");
+    }
+
+    $self->scale();
+    $kl = $self->{KL};
+    $n = ($n > $candidates->{NR_CANDIDATES}) ? $candidates->{NR_CANDIDATES} : $n;
+    for ($i = 0; $i < $n; $i++) {
+	$self->gain($candidates);
+	$self->add_feature($candidates, $candidates->{BEST_CAND});
+	$candidates->{ADDED}{$candidates->{BEST_CAND}} = 1;
+	$self->log("Adding candidate $candidates->{BEST_CAND}\n");
+	$self->scale();
+	$self->log("Actual gain: " . ($self->{KL} - $kl) . "\n");
+	$kl = $self->{KL};
+    }
+    return(1);
 }
 
-
-# write new events, parameters, and candidates
-# and clean up the mess
-sub done {
-   my($e,$p,$c,$l) = @_;
-
-   if ($p) {
-       write_parameters($p);
-   }
-   if ($e) {
-       write_events($e);
-   }
-   if ($c) {
-       write_candidates($c);
-   }
-   if ($l) {
-       write_info($l);
-   }
-   undef @pars;
-   undef @events;
-   undef @candidates;
-   undef $nr_candidates;
-   undef $nr_events;
-   undef $nr_features;
-   undef @a;
-   undef @p;
-   undef @p_ref;
-   undef @E_ref;
-   undef %is_added;
-   undef $correction_parameter;
-}
-
-
-# Preloaded methods go here.
-
-# Autoload methods go after =cut, and are processed by the autosplit program.
 
 1;
+
 __END__
+
+
 # Below is the stub of documentation for your module. You better edit it!
 
 =head1 NAME
 
-MaxEntropy - Perl module for Maximum Entropy Modeling
+MaxEntropy - Perl5 module for Maximum Entropy Modeling and Feature Induction
 
 =head1 SYNOPSIS
 
@@ -1157,9 +1304,6 @@ MaxEntropy - Perl module for Maximum Entropy Modeling
 
   # debugging messages; default 0
   $Statistics::MaxEntropy::debug = 0;
-
-  # normalise frequencies in events file; default 1
-  $Statistics::MaxEntropy::normalise = 1;
 
   # maximum number of iterations for IIS; default 100
   $Statistics::MaxEntropy::NEWTON_max_it = 100;
@@ -1174,50 +1318,44 @@ MaxEntropy - Perl module for Maximum Entropy Modeling
   # minimal distance between new and old x; default 0.001
   $Statistics::MaxEntropy::KL_min = 0.001;
 
-  # configuration of Statistics::MaxEntropy::random_init
-  # maximum number of candidates randomly generated
-  $Statistics::MaxEntropy::rand_max_candidates = 20;
+  # the size of Monte Carlo samples; default 1000
+  $Statistics::MaxEntropy::SAMPLE_size = 1000;
 
-  # maximum number of features randomly generated
-  $Statistics::MaxEntropy::rand_max_features = 20;
+  # creation of a new event space from an events file
+  $events = Statistics::MaxEntropy::new($file);
 
-  # initialisation for GIS, IIS, or FI
-  Statistics::MaxEntropy::init($events_file,
-		       $parameters_file,
-		       $candidates_file);
+  # Generalised Iterative Scaling, "corpus" means no sampling
+  $events->scale("corpus", "gis");
 
-  # random initialisation for GIS, IIS, or FI
-  Statistics::MaxEntropy::random_init($random_events_file,
-                              $random_parameters_file,
-                              $random_candidates_file);
+  # Improved Iterative Scaling, "mc" means Monte Carlo sampling
+  $events->scale("mc", "iis");
 
-  # Generalised Iterative Scaling
-  Statistics::MaxEntropy::GIS();
+  # Feature Induction algorithm, also see Statistics::Candidates POD
+  $candidates = Statistics::Candidates->new($candidates_file);
+  $events->fi("iis", $candidates, $nr_to_add, "mc");
 
-  # Improved Iterative Scaling
-  Statistics::MaxEntropy::IIS();
+  # writing new events, candidates, and parameters files
+  $events->write($some_other_file);
+  $events->write_parameters($file);
+  $events->write_parameters_with_names($file);
 
-  # Feature Induction algorithm
-  Statistics::MaxEntropy::FI($nr_candidates_to_add, $iterative_scaler);
-
-  # writes new events, candidates, and parameters files
-  Statistics::MaxEntropy::done($new_events_file,
-                       $new_parameters_file,
-        	       $new_candidates_file,
-                       $information_file);
+  # dump/undump the event space to/from a file
+  $events->dump($file);
+  $events->undump($file);
 
 
 =head1 DESCRIPTION
 
 This module is an implementation of the Generalised and Improved
 Iterative Scaling (GIS, IIS) algorithms and the Feature Induction (FI)
-algorithm as defined in (B<Darroch and Ratcliff 1972>, B<(Della Pietra
-et al. 1997)>). The purpose of the scaling algorithms is to find the
-maximum entropy distribution given a set of events and (optionally) an
-initial distribution. Also a set of candidate features may be
-specified; then the FI algorithm may be applied to find and add the
-candidate feature(s) that give the largest `gain' in terms of Kullback
-Leibler divergence when it is added to the current set of features.
+algorithm as defined in (B<Darroch and Ratcliff 1972>) and (B<Della
+Pietra et al. 1997>). The purpose of the scaling algorithms is to find
+the maximum entropy distribution given a set of events and
+(optionally) an initial distribution. Also a set of candidate features
+may be specified; then the FI algorithm may be applied to find and add
+the candidate feature(s) that give the largest `gain' in terms of
+Kullback Leibler divergence when it is added to the current set of
+features.
 
 Events are specified in terms of a set of feature functions
 (properties) f_1...f_k that map each event to {0,1}: an event is a
@@ -1240,11 +1378,11 @@ described by
 =begin latex
 
 \begin{equation*}
-    p(x) = \frac{1}{Z} e^{\sum_i \alpha_i f_i(x)}
+    p(x) = \frac{1}{Z} \exp[\sum_i \alpha_i f_i(x)]
 \end{equation*}
 where $Z$ is a normalisation factor given by
 \begin{equation*}
-    Z = \sum_x e^{\sum_i \alpha_i f_i(x)}
+    Z = \sum_x \exp[\sum_i \alpha_i f_i(x)]
 \end{equation*}
 
 =end latex
@@ -1257,190 +1395,158 @@ the find alpha_1..alpha_k such that D(p~||p), defined by
     D(p~||p) = 
        sum_x p~ . log(p~(x) / p(x)),
 
-is minimal
+is minimal under the condition that p~[f_i] = p[f_i], for all i.
 
 =end roff
 
 =begin latex
 
-
-The purpose of the IIS algorithm is
+The purpose of the scaling algorithms IIS GIS is
 the find $\alpha_1..\alpha_k$ such that $D(\tilde{p}||p)$, defined by
-
-
 \begin{equation*}
     D(\tilde{p}||p) = 
-       \sum_x \tilde{p} . \log (\frac{\tilde{p}(x)}{p(x)}),
+       \sum_x \tilde{p} \log (\frac{\tilde{p}(x)}{p(x)}),
 \end{equation*}
-is minimal.
+is minimal under the condition that for all $i$
+$\tilde{p}[f_i]=p[f_i]$.
 
 =end latex
 
+The module requires the C<Bit::SparseVector> module by Steffen Beyer and the
+C<Data::Dumper> module by Gurusamy Sarathy. Both can be obtained from
+CPAN just like this module.
 
 
-=head2 VARIABLES
+=head2 CONFIGURATION VARIABLES
 
 =over 4
 
-=item *
+=item C<$Statistics::MaxEntropy::debug>
 
-C<$Statistics::MaxEntropy::debug>
+If set to C<1>, lots of debug information, and intermediate results will be
+output. Default: C<0>
 
-If set to "1", lots of debug information, and intermediate results will
-be output. Default: "0".
-
-=item *
-
-C<$Statistics::MaxEntropy::normalise>
-
-If set to "1", frequencies in the events file are normalised; this is
-required if they not sum to "1"; default: "1".
-
-=item *
-
-C<$Statistics::MaxEntropy::NEWTON_max_it>
+=item C<$Statistics::MaxEntropy::NEWTON_max_it>
 
 Sets the maximum number of iterations in Newton's method. Newton's
 method is applied to find the new parameters \alpha_i of the features
-f_i. Default: "100".
+C<f_i>. Default: C<100>.
 
-=item *
+=item C<$Statistics::MaxEntropy::NEWTON_min>
 
-C<$Statistics::MaxEntropy::NEWTON_min>
+Sets the minimum difference between x' and x in Newton's method (used for
+computing parameter updates in IIS); if either the maximum number of
+iterations is reached or the difference between x' and x is small enough,
+the iteration is stopped. Default: C<0.001>. Sometimes features have
+Infinity or -Infinity as a solution; these features are excluded from future
+iterations.
 
-Sets the minimum difference between x' and x in Newton's method; if
-either the maximum number of iterations is reached or the difference
-between x' and x is small enough, the iteration is stopped. Default:
-"0.001".
-
-=item *
-
-C<$Statistics::MaxEntropy::KL_max_it>
+=item C<$Statistics::MaxEntropy::KL_max_it>
 
 Sets the maximum number of iterations applied in the IIS
-algorithm. Default: "100".
+algorithm. Default: C<100>.
 
-=item *
-
-C<$Statistics::MaxEntropy::KL_min>
+=item C<$Statistics::MaxEntropy::KL_min>
 
 Sets the minimum difference between KL divergences of two
 distributions in the IIS algorithm; if either the maximum number of
 iterations is reached or the difference between the divergences is
-enough, the iteration is stopped. Default: "0.001".
+enough, the iteration is stopped. Default: C<0.001>.
 
-=item *
+=item C<$Statistics::MaxEntropy::SAMPLE_size>
 
-C<$Statistics::MaxEntropy::rand_max_candidates>
-
-Configures C<Statistics::MaxEntropy::random_init>; it sets the maximum number
-candidate features that are randomly generated for each event. Values
-"2" and higher are allowed.
-
-=item *
-
-C<$Statistics::MaxEntropy::rand_max_features>
-
-Configures C<Statistics::MaxEntropy::random_init>; it sets the maximum number
-of features that are randomly generated for each event. 
-
-The minimum number of events that are randomly generates is "2". The
-maximum number of events is bounded from above by 2^{number of
-features randomly chosen}.
+Determines the number of (unique) events a sample should contain. Only
+makes sense if for sampling "mc" is selected (see below). Its default
+is C<1000>.
 
 =back
 
 
-=head2 FUNCTIONS
+=head2 METHODS
 
 =over 4
 
-=item *
+=item C<new>
 
-C<Statistics::MaxEntropy::init($events_file,>
-C<                     $parameters_file,>
-C<                     $candidates_file);>
+ $events = Statistics::MaxEntropy::new($events_file);
 
-The events file is required. The candidate and initial parameter files
-are optional. If the initial parameter file is specified as the empty
-string then random parameters from [0,1] are chosen.
+A new event space is created, and the events are read from C<$file>. The
+events file is required, its syntax is described in 
+L<FILE SYNTAX>.
 
-=item *
+=item C<write>
 
-C<Statistics::MaxEntropy::random_init($random_events_file,>
-C<                            $random_parameters_file,>
-C<                            $random_candidates_file);>
+ $events->write($file);
 
-All three files are required. Your program dies, if you leave one or
-more unspecified. A caveat: 
+Writes the events to a file. Its syntax is described in 
+L<FILE SYNTAX>.
 
-=item *
+=item C<scale>
 
-C<Statistics::MaxEntropy::GIS();>
+ $events->scale($sample, $scaler);
 
-Calls the Generalised Iterative Scaling algorithm. See 
-(B<Darroch and Ratcliff 1972>).
+If C<$scaler> equals C<"gis">, the Generalised Iterative Scaling algorithm
+(B<Darroch and Ratcliff 1972>) is applied on the event space; C<$scaler>
+equals C<"iis">, the Improved Iterative Scaling Algorithm (B<Della Pietra et
+al. 1997>) is used. If C<$sample> is C<"corpus">, there is no sampling done
+to re-estimate the parameters (the events previously read are considered a
+good sample); if it equals C<"mc"> Monte Carlo (Metropolis-Hastings)
+sampling is performed to obtain a random sample; if C<$sample> is C<"enum">
+the complete event space is enumerated.
 
-=item *
+=item C<fi>
 
-C<Statistics::MaxEntropy::IIS();>
+ fi($scaler, $candidates, $nr_to_add, $sampling);
 
-Calls the Improved Iterative Scaling algorithm. If no events were
-loaded or generated, your program exits. See (B<Della Pietra et al. 1997>).
+Calls the Feature Induction algorithm. The parameter C<$nr_to_add> is for
+the number of candidates it should add. If this number is greater than the
+number of candidates, all candidates are added. Meaningfull values for
+C<$scaler> are C<"gis"> and C<"iis">; default is C<"gis"> (see previous
+item). C<$sampling> should be one of C<"corpus">, C<"mc">, C<"enum">.
+C<$candidates> should be in the C<Statistics::Candidates> class:
 
-=item *
+ $candidates = Statistics::Candidates->new($file);
 
-C<Statistics::MaxEntropy::FI($nr_candidates_to_add, 
-                   $iterative_scaler);>
+See L<Statistics::Candidates>.
 
-Calls the Feature Induction algorithm. The parameter
-C<$nr_candidates_to_add> is for the number of candidates it should
-add. If this number is greater than the number of candidates, all
-candidates are added. If it is not specified, it "1" is used.  The
-parameter C<$iterative_scaler> can be used to provide one of scaling
-algorithm C<GIS> or C<IIS>. The references to the sub's should be
-used as follows:
+=item C<write_parameters>
 
-    $iterative_scaler = \&GIS;
-    $nr_candidates_to_add = 2;
-    FI($nr_candidates_to_add, $iterative_scaler);
+ $events->write_parameters($file);
 
-If it is not specified, the improved algorithm is used.
+=item C<write_parameters_with_names>
 
-=item *
+ $events->write_parameters_with_names($file);
 
-C<Statistics::MaxEntropy::done($new_events_file,>
-C<                     $new_parameters_file,>
-C<                     $new_candidates_file,>
-C<                     $information_file);>
+=item C<dump>
 
-All parameters are optional. The candidate numbers that were added are
-printed to the information file. The new events file contains the
-events extended with the new features, the new candidates file
-contains the set of candidates minus the candidates added. To the
-distribution file the new parameters are printed. The information file
-is used to print the indices of the candidates that were added to.
-Before a new call of C<init> or C<random_init>, calling
-C<Statistics::MaxEntropy::done> is a good thing to do.
+ $events->dump($file);
+
+C<$events> is written to C<$file> using C<Data::Dumper>.
+
+=item C<undump>
+
+ $events = Statistics::MaxEntropy->undump($file);
+
+The contents of file C<$file> is read and eval'ed into C<$events>.
 
 =back
 
 
-=head1 SYNTAX OF INPUT/OUTPUT FILES
+=head1 FILE SYNTAX
 
-Lines that start with a `#' and empty lines are ignored.
+Lines that start with a C<#> and empty lines are ignored.
 
 Below we give the syntax of in and output files.
 
 
 =head2 EVENTS FILE (input/output)
 
-Syntax of the event file (n features, and m events); the following
+Syntax of the event file (C<n> features, and C<m> events); the following
 holds for features:
 
 =over 4
 
-=item * 
+=item *
 
 each line is an event; 
 
@@ -1467,136 +1573,78 @@ the previous requirement;
 
 The frequency of each event precedes the feature columns. Features are
 indexed from right to left. This is a consequence of how
-C<Bit::Vector> reads bit strings. Each fij is a bit and freqi a float
-in the following schema:
+C<Bit::SparseVector> reads bit strings. Each C<f_ij> is a bit and C<freq_i>
+an integer in the following schema:
 
-    freq1 <white> f1n ... f13 f12 f11 <newline>
+    name_n <tab> name_n-1 ... name_2 <tab> name_1 <newline>
+    freq_1 <white> f_1n ... f_13 f_12 f_11 <newline>
       .                     .
       .                     .
       .                     .
-    freqi <white> fin ... fi3 fi2 fi1 <newline>
+    freq_i <white> f_in ... f_i3 f_i2 f_i1 <newline>
       .                     .
       .                     .
       .                     .
-    freqm <white> fmn ... fm3 fm2 fm1
+    freq_m <white> f_mn ... f_m3 f_m2 f_m1
 
-(m events, n features)
+(C<m> events, C<n> features) The feature names are separated by tabs,
+not white space. The line containing the feature names will be split
+on tabs; this implies that (non-tab) white space may be part of the
+feature names.
 
 
 =head2 PARAMETERS FILE (input/output)
 
 Syntax of the initial parameters file; one parameter per line:
 
-    par1 <newline>
+    par_1 <newline>
      .
      .
      .
-    pari <newline>
+    par_i <newline>
      .
      .
      .
-    parn
+    par_n
 
-(n features)
+The syntax of the output distribution is the same. The alternative
+procedure for saving parameters to a file
+C<write_parameters_with_names> writes files that have the following
+syntax
 
-The syntax of the output distribution is the same.
+    n <newline>
+    name_1 <tab> par_1 <newline>
+     .
+     .
+     .
+    name_i <tab> par_i <newline>
+     .
+     .
+     .
+    name_n <tab> par_n <newline>
+    bitmask
+
+where bitmask can be used to tell other programs what features to use
+in computing probabilities. Features that were ignored during scaling
+or because they are constant functions, receive a C<0> bit.
 
 
-=head2 CANDIDATES FILE (input)
+=head2 DUMP FILE (input/output)
 
-The syntax of the candidate feature file is more or less the same as
-that for the events file:
-
-=over 4
-
-=item *
-
-each line is an event (events specified in the same order as the
-events file);
-
-=item *
-
-each column is a feature;
-
-=item * 
-
-constant feature functions are forbidden;
-
-=item *
-
-values are 0 or 1; 
-
-=item *
-
-no space between features;
-
-=back
-
-fij are bits:
-
-    f1c ... f13 f12 f11 <newline>
-	     .
-	     .
-             .
-    fic ... fi3 fi2 fi1 <newline>
-	     .
-             .
-             .
-    fmc ... fm3 fm2 fm1
-
-(m events, c candidate features)
-
-=head2 INFO FILE (output)
-
-The indices of the candidates added to the field, one per line. Bit
-strings are always indexed right to left.
-
+A dump file contains the event space (which is a hash blessed into
+class C<Statistics::MaxEntropy>) as a Perl expression that can be
+evaluated with eval.
 
 
 =head1 BUGS
 
-=over 4
-
-=item *
-
 It's slow.
-
-=item *
-
-C<Statistics::MaxEntropy> communicates through files mainly. The reason for is
-a practical one: for my own purposes I needed communication through
-files; I'm using the module for large event bases (corpora), and I'm
-not interested in (large) arrays that tell me what candidates have
-been added, what parameters were found, or how the events file looks
-like in an array. My (other) software components will read the files
-again.
-
-=back
-
-
-=head1 ENVIRONMENT
-
-No environment variables are used.
-
-
-=head1 AUTHOR
-
-=begin roff
-
-Hugo WL ter Doest, terdoest@cs.utwente.nl
-
-=end roff
-
-=begin latex
-
-Hugo WL ter Doest, \texttt{terdoest\symbol{'100}cs.utwente.nl}
-
-=end latex
 
 
 =head1 SEE ALSO
 
-L<perl(1)>, L<Bit::Vector>, and L<POSIX>.
+L<perl(1)>, L<Statistics::Candidates>, L<Statistics::SparseVector>,
+L<Bit::Vector>, L<Data::Dumper>, L<POSIX>, L<Carp>.
 
 
 =head1 DIAGNOSTICS
@@ -1612,50 +1660,70 @@ it cannot open a specified events file;
 =item *
 
 if you specified a constant feature function (in the events file or
-the candidates file); this may happen sometimes if you call
-C<Statistics::MaxEntropy::random_init>;
-
-=item *
-
-if C<Statistics::MaxEntropy::FI> is called and no candidates are given;
-
-=item *
-
-if C<Statistics::MaxEntropy:IIS> is called and no events are given;
+the candidates file);
 
 =item *
 
 if the events file, candidates file, or the parameters file is not
-consistent; causes (a.o.): insufficient features, or too many features
-for some event; inconsistent candidate lines; insufficient, or to many
-event lines in the candidates file.
+consistent; possible causes are (a.o.): insufficient or too many
+features for some event; inconsistent candidate lines; insufficient,
+or to many event lines in the candidates file.
 
 =back
+
+The module captures C<SIGQUIT> and C<SIGINT>. On a C<SIGINT>
+(typically <CONTROL-C> it will dump the current event space(s) and
+die. If a C<SIGQUIT> (<CONTROL-BACKSLASH>) occurs it dumps the current
+event space as soon as possible after the first iteration it finishes.
 
 
 =head1 REFERENCES
 
 =over 4
 
-=item *
+=item (Darroch and Ratcliff 1972) 
 
-(Darroch and Ratcliff 1972) J. Darroch and D. Ratcliff, Generalised
-Iterative Scaling for log-linear models, Ann. Math. Statist., 43,
-1470-1480, 1972.
+J. Darroch and D. Ratcliff, Generalised Iterative Scaling for
+log-linear models, Ann. Math. Statist., 43, 1470-1480, 1972.
 
-=item *
+=item (Jaynes 1983)
 
-(Jaynes 1997) E.T. Jaynes, Probability theory: the logic of science,
-1997, unpublished manuscript.
+E.T. Jaynes, Papers on probability, statistics, and statistical
+physics. Ed.: R.D. Rosenkrantz. Kluwer Academic Publishers, 1983.
 
-=item *
+=item (Jaynes 1997) 
 
-(Della Pietra, Della Pietra and Lafferty 1997) Stephen Della Pietra,
-Vincent Della Pietra, and John Lafferty, Inducing features of random
-fields, In: Transactions Pattern Analysis and Machine Intelligence,
-19(4), April 1997.
+E.T. Jaynes, Probability theory: the logic of science, 1997,
+unpublished manuscript.
+C<URL:http://omega.math.albany.edu:8008/JaynesBook.html>
+
+=item (Della Pietra et al. 1997) 
+
+Stephen Della Pietra, Vincent Della Pietra, and John Lafferty,
+Inducing features of random fields, In: Transactions Pattern Analysis
+and Machine Intelligence, 19(4), April 1997.
 
 =back
+
+
+=head1 VERSION
+
+Version 0.7.
+
+
+=head1 AUTHOR
+
+=begin roff
+
+Hugo WL ter Doest, terdoest@cs.utwente.nl
+
+=end roff
+
+=begin latex
+
+Hugo WL ter Doest, \texttt{terdoest\symbol{'100}cs.utwente.nl}
+
+=end latex
 
 
 =head1 COPYRIGHT
@@ -1677,7 +1745,7 @@ The Netherlands.
 =end latex
 
 C<Statistics::MaxEntropy> comes with ABSOLUTELY NO WARRANTY and may be copied
-only under the terms of the GNU General Public License (version 2, or
+only under the terms of the GNU Library General Public License (version 2, or
 later), which may be found in the distribution.
 
 =cut
